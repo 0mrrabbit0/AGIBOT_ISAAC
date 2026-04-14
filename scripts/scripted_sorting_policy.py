@@ -41,7 +41,9 @@ class ScriptedSortingPolicy(BasePolicy):
     # ── Robot constants ──────────────────────────────────────────────
     ROBOT_BASE = np.array([0.24469, 0.09325, 0.0])
 
-    INIT_BODY = np.array([1.57, 0.0, -0.31939525311, 1.34390352404, -1.04545222194])
+    # Body joints in FK/URDF order: [bj1, bj2, bj3, bj4, bj5]
+    # G2_STATES_4 body_state is [bj5,bj4,bj3,bj2,bj1] = [1.57, 0.0, -0.319, 1.344, -1.045]
+    INIT_BODY = np.array([-1.04545222194, 1.34390352404, -0.31939525311, 0.0, 1.57])
     INIT_LEFT_ARM = np.array([
         0.739033, -0.717023, -1.524419, -1.537612, 0.27811, -0.925845, -0.839257,
     ])
@@ -53,9 +55,9 @@ class ScriptedSortingPolicy(BasePolicy):
     RIGHT_ARM_UPPER = np.array([3.1067, 2.0944, 3.1067, 1.0472, 3.1067, 1.0472, 3.1067])
 
     # ── IK parameters ────────────────────────────────────────────────
-    JOINT_SMOOTH_ALPHA = 0.5
-    MAX_JOINT_DELTA = 0.10
-    IK_POS_TOLERANCE = 0.08
+    JOINT_SMOOTH_ALPHA = 0.7
+    MAX_JOINT_DELTA = 0.15
+    IK_POS_TOLERANCE = 0.12
 
     # ── Body FK chain (URDF) ─────────────────────────────────────────
     BODY_JOINTS_URDF = [
@@ -70,7 +72,7 @@ class ScriptedSortingPolicy(BasePolicy):
 
     # ── Motion parameters ────────────────────────────────────────────
     BJ5_SPEED = 0.04          # rad/step for waist rotation
-    EEF_STEP_FAST = 0.012     # m/step for fast moves
+    EEF_STEP_FAST = 0.018     # m/step for fast moves
     EEF_STEP_SLOW = 0.008     # m/step for precise moves
     APPROACH_HEIGHT = 0.15    # m above target for pre-approach
     GRASP_HEIGHT = 0.02       # m above target for grasping
@@ -402,6 +404,15 @@ class ScriptedSortingPolicy(BasePolicy):
             print(f"  scanner:     {self._scanner_pos}")
         if self._bin_pos is not None:
             print(f"  bin:         {self._bin_pos}")
+        # FK verification: compare body_fk output with IKFKSolver
+        if self.ikfk_solver is not None:
+            fk_eef = self.ikfk_solver.compute_eef(obs["arm_14"])
+            print(f"  IKFKSolver EEF(R) local: {fk_eef['right'][:3]}")
+            print(f"  body_fk EEF world:       {eef_w}")
+            init_arm_base = self.body_fk(self.INIT_BODY)[:3, 3] + self.ROBOT_BASE
+            print(f"  body_fk arm_base (INIT): {init_arm_base}")
+            obs_arm_base = self.body_fk(obs["body"])[:3, 3] + self.ROBOT_BASE
+            print(f"  body_fk arm_base (obs):  {obs_arm_base}")
         print("=" * 60)
 
     # ── Detect target carton from instruction ────────────────────────
