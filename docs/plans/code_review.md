@@ -1,4 +1,4 @@
-# Code Review & Modification Suggestions
+# Code Review & Modification Suggestions (Round 2)
 
 **日期**: 2026-04-14
 **审查者**: 本地 Claude Code (评估端)
@@ -6,146 +6,217 @@
 
 ---
 
-## 评估状态
+## 上一轮修改评估
 
-上一次运行（有图形界面）成功启动 Isaac Sim，ScriptedSortingPolicy 被加载，carton prims 被找到，scene positions 被传递给 policy。
-机械臂在 APPROACH 阶段开始移向目标包裹，但 240 步内距离只从 0.924 缩小到 0.514（未达到 <0.04 的完成阈值）。bj1-bj4 hold 因 `robot_joint_indices` 未初始化而未生效（已有 lazy init 修复，需验证）。
-
----
-
-## BUG 1 [严重]: INIT_BODY 关节顺序错误
-
-**文件**: `scripts/scripted_sorting_policy.py` 第 44 行
-
-**问题**: `INIT_BODY` 定义为 G2_WAIST 顺序 `[bj5, bj4, bj3, bj2, bj1]`，但 `body_fk()` 期望 URDF/FK 顺序 `[bj1, bj2, bj3, bj4, bj5]`。
-
-**当前值**:
-```python
-INIT_BODY = np.array([1.57, 0.0, -0.31939525311, 1.34390352404, -1.04545222194])
-# 实际含义: [bj5=1.57, bj4=0.0, bj3=-0.319, bj2=1.344, bj1=-1.045]
-```
-
-**影响范围**:
-1. `body_fk(INIT_BODY)` — bj1 用了 1.57 (实为 bj5 值)，FK 输出完全错误
-2. `_compute_bj5_for_target()` 第 200-217 行 — 用 INIT_BODY.copy() 做 bj5 sweep，bj1-bj4 值是错的，计算出的 bj5 目标角度不正确
-3. `INIT_BODY[4]` 被当作 bj5 初始值用于 `_phase_return` (第 739 行) 和 `_phase_done` (第 751 行)，但 `INIT_BODY[4] = -1.045` 实为 bj1 值，bj5 实际初始值是 1.57
-4. `_parse_obs()` 第 345 行的 fallback `self.INIT_BODY[4]` 也是错的
-
-**修复**: 将 INIT_BODY 改为 FK 顺序 `[bj1, bj2, bj3, bj4, bj5]`:
-
-```python
-# Body joints in FK/URDF order: [bj1, bj2, bj3, bj4, bj5]
-# Derived from G2_STATES_4 body_state [bj5,bj4,bj3,bj2,bj1] = [1.57, 0.0, -0.319, 1.344, -1.045]
-INIT_BODY = np.array([-1.04545222194, 1.34390352404, -0.31939525311, 0.0, 1.57])
-```
-
-修复后 `INIT_BODY[4] = 1.57 = bj5 初始值` ✓，`body_fk(INIT_BODY)` 输入正确 ✓
-
-**注意**: `_get_body_joints()` 在运行时用 `states[16:21]` (已经是 FK 顺序 [bj1..bj5]) 覆盖所有值，所以运行时 FK 不受影响。但离线计算（bj5 sweep、init 日志）全部错误。
+BUG 1 (INIT_BODY 顺序) 和 BUG 2 (速度参数) 已在 commit `a4b9dd0` 中修复，确认正确：
+- INIT_BODY 已改为 FK 顺序 `[-1.045, 1.344, -0.319, 0.0, 1.57]` ✓
+- 速度参数已调优 ✓
+- FK 验证日志已添加 ✓
+- bj1-bj4 hold 已验证生效: `[Patch] bj1-bj4 hold active: indices=[0, 1, 6, 11]` ✓
+- bj5 初始值正确: `bj5: 1.5700` ✓
 
 ---
 
-## BUG 2 [中等]: 机械臂逼近速度过慢
+## 本轮运行结果：全部 0 分
 
-**文件**: `scripts/scripted_sorting_policy.py`
-
-**现象**: APPROACH 阶段 240 步只移动了 0.41m (0.924→0.514)，有效速度约 0.0017 m/step，远低于 `EEF_STEP_FAST = 0.012 m/step`。
-
-**根因分析**: 
-- `MAX_JOINT_DELTA = 0.10` (第 57 行) — 每步关节增量上限太紧，IK 解算出的大角度变化被截断
-- `JOINT_SMOOTH_ALPHA = 0.5` (第 56 行) — 平滑系数进一步减半实际移动量
-- 综合效果: 实际每步只能执行 `0.10 * 0.5 = 0.05 rad` 的关节变化，导致末端移动缓慢
-- BUG 1 导致 bj5 计算错误，可能使目标在 arm_base_link 中位置偏离最优方向，IK 收敛更差
-
-**修复建议** (在 `scripted_sorting_policy.py` 常量区):
-```python
-JOINT_SMOOTH_ALPHA = 0.7    # 原 0.5 → 0.7 (更快跟随)
-MAX_JOINT_DELTA = 0.15      # 原 0.10 → 0.15 (允许更大关节变化)
-EEF_STEP_FAST = 0.018       # 原 0.012 → 0.018 (更大笛卡尔步长)
-IK_POS_TOLERANCE = 0.12     # 原 0.08 → 0.12 (接受稍差的 IK 解)
+```
+Follow:          0.0
+PickUpOnGripper: 0.0
+Inside:          0.0
+Upright:         0.0
+PickUpOnGripper: 0.0
+Inside:          0.0
+E2E:             0
 ```
 
-**优先级**: 先修 BUG 1 再调参。BUG 1 修好后 bj5 计算正确，目标位置在 arm 可达范围内最优位置，IK 收敛会自然改善。
+APPROACH 阶段 d 从 0.841 下降到 0.397 后停滞不前（500 步），然后 timeout 进入 GRASP，GRASP 阶段 d 从 0.309 继续停滞。机械臂完全无法接近目标。
 
 ---
 
-## BUG 3 [低]: 目标包裹匹配逻辑失效
+## BUG 4 [致命]: ROBOT_BASE 缺少 z 高度 — 机械臂无法到达任何物体
 
-**文件**: `scripts/run_sorting_benchmark.py` 第 401-409 行 + `scripts/scripted_sorting_policy.py` 第 417-435 行
+**文件**: `scripts/scripted_sorting_policy.py` 第 42 行
 
-**问题**: 运行时 carton prim 名称是哈希 ID（如 `benchmark_carton_dd2ffc11`），代码用 `"028" in name` 或 `"020" in name` 匹配永远失败，总是 fallback 到第一个 carton。
+**问题**: `ROBOT_BASE = [0.24469, 0.09325, 0.0]` 的 z=0.0，但 G2 机器人是站立的人形机器人，其 base_link 在世界坐标中应该在 ~0.83m 高度。
 
-**影响**: 当场景有多个 carton 时可能抓错目标。当前 instance 0 只有一个 carton 所以不影响。
-
-**修复建议**: 
-1. 在 `run_sorting_benchmark.py` 的 `_create_env_pi` 中，解析 `scene_info.json` 的 layout 来获取 carton 的 USD 类型名：
-
-```python
-# 在 _create_env_pi 中，carton_positions 之后添加:
-# 解析 scene_info.json 获取 carton USD 类型映射
-carton_type_map = {}  # {prim_name: usd_type}  例如 {"benchmark_carton_dd2ffc11": "carton_028"}
-import json as _json
-import geniesim.utils.system_utils as _su
-scene_info_path = os.path.join(
-    _su.benchmark_conf_path(), "llm_task",
-    self.args.sub_task_name, str(instance_id), "scene_info.json",
-)
-if os.path.exists(scene_info_path):
-    with open(scene_info_path) as f:
-        si = _json.load(f)
-    for obj_id, obj_data in si.get("layout", {}).items():
-        if "carton" in obj_id:
-            carton_type_map[obj_id] = obj_data.get("usd", "")
-    if hasattr(self, 'policy') and hasattr(self.policy, 'set_carton_type_map'):
-        self.policy.set_carton_type_map(carton_type_map)
+**运行时证据** (来自 FK 验证日志):
+```
+arm_base world (body_fk):  [0.565, 0.233, 0.230]   ← 肩膀在 z=0.23m，几乎在地面
+EEF world (body_fk):       [0.934, 0.677, 0.066]   ← 夹爪在 z=0.07m，在地面上
+carton world (实际):       [0.495, 0.881, 0.775]   ← 包裹在 z=0.78m (桌面高度)
+scanner world (实际):      [0.929, 0.000, 1.167]   ← 扫码台在 z=1.17m
 ```
 
-2. 在 `scripted_sorting_policy.py` 中基于 USD 类型匹配目标
+**根因**: body_fk 链从 ROBOT_BASE 开始，经过 bj1-bj5 关节到达 arm_base_link。但 ROBOT_BASE z=0.0 意味着链从地面开始。实际上 G2 机器人的 base_link（骨盆/腰部）在站立时距地面约 0.83m（腿部高度）。
 
-**暂时可忽略** — 当前 fallback 到第一个 carton 能工作。
+**影响**:
+- `world_to_arm_base()` 算出的目标在 arm 局部坐标中位置完全错误（z 差 ~0.83m）
+- IK 求解的是一个不存在的目标位置 → 关节角度错误 → 机械臂往错误方向移动
+- 这是机械臂无法接近包裹的**根本原因**
+
+**修复方案**: 在 `run_sorting_benchmark.py` 的 `_create_env_pi` 中查询机器人实际世界位置，传递给 policy：
+
+```python
+# 在 create_env 的 post-creation 部分，scanner/bin 查询之后添加:
+# Query robot base world position
+robot_base_z = 0.0
+try:
+    # 尝试可能的机器人 prim 路径
+    for robot_path in ["/Workspace/Robot", "/World/Robot", "/Workspace/robot"]:
+        try:
+            rpos, rrot = self.api_core.get_obj_world_pose(robot_path)
+            robot_base_z = float(rpos[2])
+            print(f"[Patch] Robot base world z={robot_base_z:.4f} (from {robot_path})")
+            break
+        except Exception:
+            continue
+    
+    # 如果查不到机器人 prim，用 EEF 实际世界坐标反推
+    if robot_base_z == 0.0:
+        # 获取 env reset 后的第一帧 EEF 实际世界位置
+        # 然后用 IKFKSolver 的 EEF local + body_fk 反算缺失的 z offset
+        pass
+except Exception as e:
+    print(f"[Patch] WARNING: failed to query robot base: {e}")
+
+if hasattr(self, 'policy') and robot_base_z > 0.1:
+    self.policy.ROBOT_BASE[2] = robot_base_z
+    print(f"[Patch] Updated policy ROBOT_BASE z={robot_base_z:.4f}")
+```
+
+**如果查不到 prim path，替代方案**：
+
+根据仿真数据反推 z 偏移：
+- 扫码台在 z=1.167，通常扫码台面在机器人胸前，合理
+- 桌面在 z≈0.78，通常桌面在机器人腰部偏下，合理
+- 如果肩膀（arm_base）应在 z≈1.06，当前 body_fk 输出 z=0.23，差值 0.83
+
+可以在 policy 里硬编码一个合理估算：
+```python
+# 临时方案：如果 ROBOT_BASE z 仍为 0，用估算值
+ROBOT_BASE = np.array([0.24469, 0.09325, 0.83])
+```
+
+但优先应通过仿真查询获取准确值。
 
 ---
 
-## 建议 1: 验证 bj1-bj4 hold
+## BUG 5 [严重]: 目标包裹选错 — policy 瞄准的不是评测器追踪的包裹
 
-**文件**: `scripts/run_sorting_benchmark.py` 第 429-461 行
+**运行时证据**:
+```
+评测器追踪: benchmark_carton_00364e8c → 位置 [0.302, 0.700, 0.779]
+policy 瞄准: benchmark_carton_dd2ffc11 → 位置 [0.495, 0.881, 0.775]  (dict 第一个)
+```
 
-lazy init 的 `_body_indices_cache` 逻辑已写好，但未经运行验证。下次运行时注意看日志：
-- 应该出现 `[Patch] bj1-bj4 hold active: indices=[...]`
-- 如果没出现，说明 `robot_joint_indices` 属性仍不可用，需要检查是否在 `reset()` 之后才有
+**问题**: 场景有 11 个 carton，policy 选了 dict 迭代的第一个，不是评测器要求的目标包裹。评测器通过 `problems.json` 指定了目标为 `benchmark_carton_00364e8c`。
+
+**修复方案**: 从 `problems.json` 解析目标 carton 名称，传给 policy。
+
+在 `run_sorting_benchmark.py` 的 `_create_env_pi` 中：
+
+```python
+# 在 carton_positions 之后，解析 problems.json 获取目标 carton 名称
+target_carton_name = None
+try:
+    import json as _json
+    import geniesim.utils.system_utils as _su
+    problems_path = os.path.join(
+        _su.benchmark_conf_path(), "llm_task",
+        self.args.sub_task_name, str(instance_id), "problems.json",
+    )
+    if os.path.exists(problems_path):
+        with open(problems_path) as f:
+            problems = _json.load(f)
+        # 在 problems 结构中搜索 Follow action 的 obj_name
+        def _find_follow_target(obj):
+            if isinstance(obj, dict):
+                if obj.get("class_name") == "Follow":
+                    params = obj.get("params", {})
+                    names = params.get("obj_name_list", [])
+                    if names:
+                        return names[0]
+                for v in obj.values():
+                    r = _find_follow_target(v)
+                    if r:
+                        return r
+            elif isinstance(obj, list):
+                for item in obj:
+                    r = _find_follow_target(item)
+                    if r:
+                        return r
+            return None
+        target_carton_name = _find_follow_target(problems)
+        if target_carton_name:
+            print(f"[Patch] Target carton from problems.json: {target_carton_name}")
+except Exception as e:
+    print(f"[Patch] WARNING: failed to parse problems.json: {e}")
+
+# 用目标名称从 carton_positions 中选择
+target_carton_pos = None
+if target_carton_name and target_carton_name in carton_positions:
+    target_carton_pos = carton_positions[target_carton_name]
+    print(f"[Patch] Matched target carton: {target_carton_name} at {target_carton_pos}")
+elif carton_positions:
+    # fallback 到第一个
+    name, pos = next(iter(carton_positions.items()))
+    target_carton_pos = pos
+    print(f"[Patch] WARNING: target not found, fallback to {name}")
+```
+
+然后将 `target_carton_pos` 传给 `self.policy.set_scene_positions()`（替换当前的 "028"/"020" 匹配逻辑）。
 
 ---
 
-## 建议 2: 添加运行时 body FK 验证日志
+## BUG 6 [中等]: APPROACH 阶段不转腰 — 可能需要 bj5 旋转
 
-**文件**: `scripts/scripted_sorting_policy.py` 的 `_log_init()` 方法 (第 385-405 行)
+**文件**: `scripts/scripted_sorting_policy.py` `_phase_approach()` 方法
 
-建议在 `_log_init` 中添加 FK 验证，对比 FK 输出与 IKFKSolver 输出，确认坐标系一致：
+**当前逻辑**: `bj5_hold = obs["bj5"]` — 保持当前腰部角度不动。
+
+**问题**: 目标包裹可能不在当前 bj5 角度的手臂可达范围内。正确的 carton (`benchmark_carton_00364e8c` at [0.302, 0.700, 0.779]) 可能需要特定 bj5 角度才能让手臂够到。
+
+**修复建议**: APPROACH 阶段应该在移动手臂的同时旋转 bj5 到 `_bj5_table`：
 
 ```python
-# 在 _log_init 的 print 块末尾添加:
-if self.ikfk_solver is not None:
-    fk_eef = self.ikfk_solver.compute_eef(obs["arm_14"])
-    print(f"  IKFKSolver EEF(R): {fk_eef['right'][:3]}")
-    print(f"  FK body chain EEF world: {eef_w}")
-    print(f"  FK body chain test (init): {self.body_fk(self.INIT_BODY)[:3,3] + self.ROBOT_BASE}")
+def _phase_approach(self, obs: dict) -> np.ndarray:
+    # Rotate bj5 toward table while approaching
+    bj5_target = self._bj5_table
+    new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
+    
+    target_w = self._carton_pos.copy()
+    target_w[2] += self.APPROACH_HEIGHT
+    target_l = self.world_to_arm_base(target_w, obs["body"])
+    new_joints, dist = self._move_right_toward(
+        target_l, obs["r_eef_pos"], obs["r_eef_quat"],
+        obs["arm_14"], step_size=self.EEF_STEP_FAST,
+    )
+    action = self._build_action(obs["left_arm"], new_joints, new_bj5)
+    self._log(obs, target_w, "above_carton")
+    
+    if dist < 0.04 or self.sub_step > 500:
+        self._set_phase("GRASP")
+    return action
 ```
+
+**注意**: 这个修改在 BUG 4 (z 偏移) 修好后才有意义。z 偏移是根本原因。
 
 ---
 
 ## 修改优先级
 
-1. **BUG 1** (INIT_BODY 顺序) — **必须立即修复**，影响所有 bj5 计算和 FK 输出
-2. **BUG 2** (速度参数) — 修完 BUG 1 后调参
-3. 建议 2 (FK 验证日志) — 有助于确认修复效果
-4. BUG 3 (carton 匹配) — 暂不影响，可后续处理
+1. **BUG 4** (ROBOT_BASE z=0) — **根本原因**，必须立即修复
+2. **BUG 5** (目标包裹选错) — 即使手臂能到达，瞄错了包裹也不得分
+3. **BUG 6** (APPROACH 不转腰) — 优化可达性
+4. 之前的 BUG 1-2 已修复 ✓
 
 ---
 
 ## 下次运行检查清单
 
-- [ ] `[Patch] bj1-bj4 hold active` 日志是否出现
-- [ ] `[Init] Calibration` 中 body_joints 打印值是否合理（bj5 应 ≈ 1.57）
-- [ ] APPROACH 阶段 d 下降速度是否加快（目标 <0.04 在 200 步内）
-- [ ] 是否进入 GRASP 阶段
-- [ ] bj5 sweep 计算的 carton/scanner/bin 角度是否合理
+- [ ] 查到 robot base world z > 0（应 ≈ 0.83m）
+- [ ] arm_base world z ≈ 1.0-1.1m（肩膀高度合理）
+- [ ] EEF world z ≈ 0.8-0.9m（初始时夹爪在腰部高度）
+- [ ] 目标 carton 名称与 Follow 评测器一致（`benchmark_carton_00364e8c`）
+- [ ] APPROACH 阶段 d 快速下降到 <0.04
+- [ ] Follow 评分 > 0
