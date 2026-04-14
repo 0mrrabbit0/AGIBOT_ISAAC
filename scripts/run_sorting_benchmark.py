@@ -196,10 +196,45 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             except ImportError:
                 pass
 
+            print(f"[Patch] create_env called: episode_file={episode_file}, "
+                  f"instance_id={instance_id}")
+            print(f"[Patch] task_config keys: {list(self.task_config.keys())}")
+            if "robot" in self.task_config:
+                print(f"[Patch] robot config: {self.task_config['robot']}")
+
             _original_create_env(self, episode_file, instance_id)
             self.args.model_arc = original_arc
 
+            # Log scene loading results
+            if hasattr(self, 'env') and self.env is not None:
+                env = self.env
+                print(f"[Patch] Environment created: {type(env).__name__}")
+                if hasattr(env, 'usd_objects'):
+                    obj_names = list(env.usd_objects.keys()) if env.usd_objects else []
+                    print(f"[Patch] USD objects in scene ({len(obj_names)}): {obj_names}")
+                if hasattr(env, 'object_names'):
+                    print(f"[Patch] object_names: {env.object_names}")
+            else:
+                print("[Patch] WARNING: env is None after create_env!")
+
         TaskBenchmark.create_env = _create_env_pi
+
+        # Also patch evaluate_policy to log episode info
+        _original_evaluate = TaskBenchmark.evaluate_policy
+
+        def _evaluate_debug(self, *args, **kwargs):
+            print(f"[Patch] evaluate_policy called")
+            if hasattr(self, 'scene_instance_ids'):
+                print(f"[Patch] scene_instance_ids: {self.scene_instance_ids}")
+            if hasattr(self, 'task_generator') and self.task_generator is not None:
+                tg = self.task_generator
+                if hasattr(tg, 'episode_files'):
+                    print(f"[Patch] episode_files: {tg.episode_files}")
+                if hasattr(tg, 'num_episodes'):
+                    print(f"[Patch] num_episodes: {tg.num_episodes}")
+            return _original_evaluate(self, *args, **kwargs)
+
+        TaskBenchmark.evaluate_policy = _evaluate_debug
 
         print("[Patch] TaskBenchmark patched for ScriptedSortingPolicy + PiEnv")
 

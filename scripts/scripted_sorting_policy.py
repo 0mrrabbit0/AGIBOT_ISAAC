@@ -51,6 +51,11 @@ class ScriptedSortingPolicy(BasePolicy):
     # Gripper offset: distance from arm_r_end_link (FK point) to gripper center
     GRIPPER_Z_OFFSET = 0.143
 
+    # ── IK control parameters ────────────────────────────────────────
+    JOINT_SMOOTH_ALPHA = 0.5   # blend factor: 0=keep current, 1=full IK
+    MAX_JOINT_DELTA = 0.15     # max joint change per step (rad)
+    IK_POS_TOLERANCE = 0.10    # max acceptable IK position error (m)
+
     # ── Scene positions (world frame) ────────────────────────────────
     SCANNER_POS = np.array([0.929, 0.0, 1.163])
     BIN_POS = np.array([0.300, -0.917, 0.837])
@@ -73,12 +78,16 @@ class ScriptedSortingPolicy(BasePolicy):
     BJ5_BIN = -2.0         # face toward bin (right side)
 
     # ── URDF body chain parameters ───────────────────────────────────
+    # Note: These were derived to match the simulation's FK. The raw URDF
+    # has slightly different xyz values and axis signs, but those don't
+    # account for the simulation's internal joint convention. These values
+    # produce correct arm_base_link positions (verified at z≈0.507m).
     BODY_JOINTS_URDF = [
-        ([0.102, 0, 0.144],      'y',  1),   # joint1
-        ([-0.32627, 0, 0.15214], 'y',  1),   # joint2
-        ([0.22875, -0.0019, 0],  'x',  1),   # joint3
-        ([0.17625, 0.0019, 0],   'y', -1),   # joint4
-        ([0.0002112, -0.0024, 0.14475], 'z', 1),  # joint5
+        ([0.102, 0, 0.144],      'y',  1),   # bj1 - pitch
+        ([-0.32627, 0, 0.15214], 'y',  1),   # bj2 - pitch
+        ([0.22875, -0.0019, 0],  'x',  1),   # bj3 - roll
+        ([0.17625, 0.0019, 0],   'y', -1),   # bj4 - pitch
+        ([0.0002112, -0.0024, 0.14475], 'z', 1),  # bj5 - yaw
     ]
     ARM_BASE_ORIGIN = np.array([0.0, 0.0, 0.3085])
     ARM_BASE_RPY = np.array([-np.pi / 2, 0, 0])
@@ -102,6 +111,8 @@ class ScriptedSortingPolicy(BasePolicy):
         self.variant = 0
         self._detect_variant = True
         self._init_eef_logged = False
+        self._init_eef_rpy = None  # cached initial EEF orientation
+        self._calibrated = False
         self.reset()
 
     # ── Reset ────────────────────────────────────────────────────────
@@ -114,6 +125,7 @@ class ScriptedSortingPolicy(BasePolicy):
         self.target_bj5 = self.INIT_BODY[4]
         self._detect_variant = True
         self._init_eef_logged = False
+        self._calibrated = False
         return None
 
     # ── Rotation helpers ─────────────────────────────────────────────
@@ -227,7 +239,12 @@ class ScriptedSortingPolicy(BasePolicy):
                            current_arm_14, step_size=0.015, target_rpy=None,
                            n_iter=10):
         """Move right EEF toward target_pos_local with small steps.
-        Returns (new_right_joints_7, distance_remaining)."""
+
+        Uses joint-space smoothing and convergence verification to prevent
+        erratic arm movements from IK instability.
+
+        Returns (new_right_joints_7, distance_remaining).
+        """
         error = target_pos_local - current_eef_pos
         dist = np.linalg.norm(error)
         if dist < 0.002:
@@ -239,17 +256,46 @@ class ScriptedSortingPolicy(BasePolicy):
             direction = error
         next_pos = current_eef_pos + direction
 
+        # Use initial EEF orientation if available (more stable than current)
         if target_rpy is None:
-            target_rpy = self._get_right_eef_rpy(current_eef_quat)
+            if self._init_eef_rpy is not None:
+                target_rpy = self._init_eef_rpy.copy()
+            else:
+                target_rpy = self._get_right_eef_rpy(current_eef_quat)
+
         result = self._compute_right_ik(next_pos, target_rpy, current_arm_14,
-                                         n_iter=n_iter)
+                                        n_iter=n_iter)
 
         if result is not None:
-            right_joints = result[7:14]
-            # Use IK result directly (multi-iteration already converges well)
-            right_joints = np.clip(right_joints, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
-            self.last_right_arm = right_joints.copy()
-            return right_joints, dist
+            ik_right = result[7:14]
+            ik_right = np.clip(ik_right, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
+
+            # ── IK convergence check ──
+            # Verify the IK result's FK matches the target
+            ik_arm_14 = np.concatenate([current_arm_14[:7], ik_right])
+            ik_eef = self.ikfk_solver.compute_eef(ik_arm_14)
+            ik_eef_pos = np.array(ik_eef["right"][:3])
+            ik_error = np.linalg.norm(ik_eef_pos - next_pos)
+
+            if ik_error > self.IK_POS_TOLERANCE:
+                # IK didn't converge well — use smaller step or hold
+                if self.step_count % 30 == 0:
+                    print(f"[IK] Poor convergence: ik_err={ik_error:.4f} "
+                          f"(tol={self.IK_POS_TOLERANCE}), holding position")
+                return self.last_right_arm, dist
+
+            # ── Joint-space smoothing ──
+            # Blend IK result with current joints to prevent jumps
+            current_right = current_arm_14[7:14]
+            delta = ik_right - current_right
+            # Clamp per-joint delta
+            delta = np.clip(delta, -self.MAX_JOINT_DELTA, self.MAX_JOINT_DELTA)
+            # Apply alpha blending
+            smoothed = current_right + self.JOINT_SMOOTH_ALPHA * delta
+
+            smoothed = np.clip(smoothed, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
+            self.last_right_arm = smoothed.copy()
+            return smoothed, dist
         return self.last_right_arm, dist
 
     # ── Get current body joints from observation ─────────────────────
@@ -307,6 +353,26 @@ class ScriptedSortingPolicy(BasePolicy):
         action[20] = bj5
         return action
 
+    # ── Periodic debug logging ───────────────────────────────────────
+    def _log_debug(self, r_eef_pos, body_joints, target_world=None, label=""):
+        """Log debug info periodically (every 30 steps)."""
+        if self.step_count % 30 != 0:
+            return
+        eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
+        arm_base_w = self.arm_base_to_world(np.zeros(3), body_joints)
+        msg = (f"[DBG s={self.step_count}] phase={self.phase} ps={self.phase_step} "
+               f"eef_local=[{r_eef_pos[0]:.3f},{r_eef_pos[1]:.3f},{r_eef_pos[2]:.3f}] "
+               f"eef_world=[{eef_world[0]:.3f},{eef_world[1]:.3f},{eef_world[2]:.3f}] "
+               f"arm_base=[{arm_base_w[0]:.3f},{arm_base_w[1]:.3f},{arm_base_w[2]:.3f}]")
+        if target_world is not None:
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            msg += (f" tgt_w=[{target_world[0]:.3f},{target_world[1]:.3f},{target_world[2]:.3f}]"
+                    f" tgt_l=[{target_local[0]:.3f},{target_local[1]:.3f},{target_local[2]:.3f}]"
+                    f" d={np.linalg.norm(target_local - r_eef_pos):.4f}")
+        if label:
+            msg += f" [{label}]"
+        print(msg)
+
     # ── Main act method ──────────────────────────────────────────────
     def act(self, observations, **kwargs):
         self.step_count += 1
@@ -327,15 +393,36 @@ class ScriptedSortingPolicy(BasePolicy):
 
         body_joints = self._get_body_joints(states)
 
-        # Log initial EEF once for debugging
+        # ── Initial calibration logging ──
         if not self._init_eef_logged:
             self._init_eef_logged = True
             r_eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
-            print(f"[Policy] Initial right EEF local: {r_eef_pos}")
-            print(f"[Policy] Initial right EEF world: {r_eef_world}")
-            print(f"[Policy] Initial right EEF quat: {r_eef_quat}")
-            print(f"[Policy] Initial bj5: {bj5}")
-            print(f"[Policy] Gripper state: {grip_r_state}")
+            arm_base_world = self.arm_base_to_world(np.zeros(3), body_joints)
+            print("=" * 60)
+            print("[CALIBRATION] Initial state at step 1:")
+            print(f"  states length: {len(states)}")
+            print(f"  body_joints: {body_joints}")
+            print(f"  right_arm joints: {right_arm}")
+            print(f"  right EEF local (arm_base frame): {r_eef_pos}")
+            print(f"  right EEF world (computed): {r_eef_world}")
+            print(f"  right EEF quat: {r_eef_quat}")
+            print(f"  arm_base_link world pos: {arm_base_world}")
+            print(f"  bj5: {bj5}")
+            print(f"  gripper state: {grip_r_state}")
+
+            # Cache initial EEF orientation for stable IK
+            self._init_eef_rpy = self._get_right_eef_rpy(r_eef_quat)
+            print(f"  init EEF RPY: {self._init_eef_rpy}")
+
+            # Show distances to all targets from current arm_base
+            for name, pos in [("carton_v0", self.CARTON_POSITIONS[0]),
+                              ("carton_v1", self.CARTON_POSITIONS[1]),
+                              ("scanner", self.SCANNER_POS),
+                              ("bin", self.BIN_POS)]:
+                local = self.world_to_arm_base(pos, body_joints)
+                print(f"  {name}: world={pos} local={local} "
+                      f"dist={np.linalg.norm(local):.3f}")
+            print("=" * 60)
 
         # Detect variant on first call
         if self._detect_variant:
@@ -363,34 +450,30 @@ class ScriptedSortingPolicy(BasePolicy):
 
         elif self.phase == "APPROACH_ABOVE_CARTON":
             action[20] = self.BJ5_TABLE
-            # Target: above carton. EEF should be above carton + gripper offset
             target_world = carton_pos.copy()
-            target_world[2] += 0.15  # above carton
+            target_world[2] += 0.15
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.025
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if self.phase_step % 50 == 0:
-                print(f"[Policy] APPROACH_ABOVE dist={dist:.4f}")
-            if dist < 0.04 or self.phase_step > 300:
+            self._log_debug(r_eef_pos, body_joints, target_world, "APPROACH_ABOVE")
+            if dist < 0.04 or self.phase_step > 400:
                 self._next_phase("LOWER_TO_CARTON")
 
         elif self.phase == "LOWER_TO_CARTON":
             action[20] = self.BJ5_TABLE
-            # Lower EEF to carton level (gripper extends below EEF)
             target_world = carton_pos.copy()
-            target_world[2] += 0.02  # slightly above carton center
+            target_world[2] += 0.02
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.012
+                step_size=0.008, n_iter=15
             )
             action[7:14] = new_joints
-            if self.phase_step % 30 == 0:
-                print(f"[Policy] LOWER_TO dist={dist:.4f}")
-            if dist < 0.03 or self.phase_step > 200:
+            self._log_debug(r_eef_pos, body_joints, target_world, "LOWER_TO")
+            if dist < 0.03 or self.phase_step > 250:
                 self._next_phase("GRASP_CARTON")
 
         elif self.phase == "GRASP_CARTON":
@@ -404,35 +487,34 @@ class ScriptedSortingPolicy(BasePolicy):
         elif self.phase == "LIFT_CARTON":
             action[20] = self.BJ5_TABLE
             action[15] = 1.0
-            # Lift above carton position
             target_world = carton_pos.copy()
             target_world[2] += 0.22
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.018
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.04 or self.phase_step > 100:
+            self._log_debug(r_eef_pos, body_joints, target_world, "LIFT")
+            if dist < 0.04 or self.phase_step > 150:
                 self._next_phase("RETRACT_FROM_TABLE")
 
         elif self.phase == "RETRACT_FROM_TABLE":
             action[20] = self.BJ5_TABLE
             action[15] = 1.0
-            # Retract arm toward body before rotating waist
             target_world = carton_pos.copy()
             target_world[2] += 0.28
-            # Move XY toward robot base to clear table
             to_robot = self.ROBOT_BASE[:2] - target_world[:2]
             to_robot_norm = to_robot / (np.linalg.norm(to_robot) + 1e-8)
             target_world[:2] += to_robot_norm * 0.18
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.018
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.05 or self.phase_step > 80:
+            self._log_debug(r_eef_pos, body_joints, target_world, "RETRACT")
+            if dist < 0.05 or self.phase_step > 120:
                 self._next_phase("ROTATE_TO_SCANNER")
 
         elif self.phase == "ROTATE_TO_SCANNER":
@@ -447,33 +529,31 @@ class ScriptedSortingPolicy(BasePolicy):
         elif self.phase == "APPROACH_SCANNER":
             action[20] = self.BJ5_SCANNER
             action[15] = 1.0
-            # Target: above scanner
             target_world = self.SCANNER_POS.copy()
             target_world[2] += 0.15
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.022
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if self.phase_step % 50 == 0:
-                print(f"[Policy] APPROACH_SCANNER dist={dist:.4f}")
-            if dist < 0.04 or self.phase_step > 300:
+            self._log_debug(r_eef_pos, body_joints, target_world, "APPROACH_SCANNER")
+            if dist < 0.04 or self.phase_step > 400:
                 self._next_phase("LOWER_TO_SCANNER")
 
         elif self.phase == "LOWER_TO_SCANNER":
             action[20] = self.BJ5_SCANNER
             action[15] = 1.0
-            # Lower onto scanner surface
             target_world = self.SCANNER_POS.copy()
-            target_world[2] += 0.03  # slightly above scanner center
+            target_world[2] += 0.03
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.008
+                step_size=0.006, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.03 or self.phase_step > 150:
+            self._log_debug(r_eef_pos, body_joints, target_world, "LOWER_SCANNER")
+            if dist < 0.03 or self.phase_step > 200:
                 self._next_phase("RELEASE_SCANNER")
 
         elif self.phase == "RELEASE_SCANNER":
@@ -487,16 +567,15 @@ class ScriptedSortingPolicy(BasePolicy):
         elif self.phase == "LIFT_FROM_SCANNER_PRE":
             action[20] = self.BJ5_SCANNER
             action[15] = 0.0
-            # Lift slightly to let carton settle on scanner
             target_world = self.SCANNER_POS.copy()
             target_world[2] += 0.13
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.012
+                step_size=0.010, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.04 or self.phase_step > 80:
+            if dist < 0.04 or self.phase_step > 100:
                 self._next_phase("WAIT_SETTLE")
 
         elif self.phase == "WAIT_SETTLE":
@@ -510,16 +589,16 @@ class ScriptedSortingPolicy(BasePolicy):
         elif self.phase == "LOWER_REGRASP":
             action[20] = self.BJ5_SCANNER
             action[15] = 0.0
-            # Lower back to scanner to re-pick
             target_world = self.SCANNER_POS.copy()
             target_world[2] += 0.03
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.010
+                step_size=0.008, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.03 or self.phase_step > 120:
+            self._log_debug(r_eef_pos, body_joints, target_world, "LOWER_REGRASP")
+            if dist < 0.03 or self.phase_step > 150:
                 self._next_phase("REGRASP_SCANNER")
 
         elif self.phase == "REGRASP_SCANNER":
@@ -538,10 +617,11 @@ class ScriptedSortingPolicy(BasePolicy):
             target_local = self.world_to_arm_base(target_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.018
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if dist < 0.05 or self.phase_step > 100:
+            self._log_debug(r_eef_pos, body_joints, target_world, "LIFT_FROM_SCANNER")
+            if dist < 0.05 or self.phase_step > 150:
                 self._next_phase("ROTATE_TO_BIN")
 
         elif self.phase == "ROTATE_TO_BIN":
@@ -556,28 +636,19 @@ class ScriptedSortingPolicy(BasePolicy):
         elif self.phase == "APPROACH_BIN":
             action[20] = self.BJ5_BIN
             action[15] = 1.0
-            # Bin is beyond arm reach (~1.13m vs ~1.03m max).
-            # Strategy: extend arm maximally toward bin, then release.
-            # Target a point between arm_base and bin, at max reach.
             arm_world = self.arm_base_to_world(np.zeros(3), body_joints)
             to_bin = self.BIN_POS - arm_world
             to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
-            # Target at ~0.75m from arm_base in the bin direction (within reach)
-            max_reach_world = arm_world + to_bin_dir * 0.70
-            # Keep height above bin to drop from above
+            max_reach_world = arm_world + to_bin_dir * 0.65
             max_reach_world[2] = max(self.BIN_POS[2] + 0.20, max_reach_world[2])
             target_local = self.world_to_arm_base(max_reach_world, body_joints)
             new_joints, dist = self._move_right_toward(
                 target_local, r_eef_pos, r_eef_quat, current_arm_14,
-                step_size=0.022
+                step_size=0.012, n_iter=15
             )
             action[7:14] = new_joints
-            if self.phase_step % 50 == 0:
-                eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
-                bin_dist = np.linalg.norm(eef_world - self.BIN_POS)
-                print(f"[Policy] APPROACH_BIN eef_dist_to_target={dist:.4f} "
-                      f"eef_to_bin={bin_dist:.4f}")
-            if dist < 0.06 or self.phase_step > 250:
+            self._log_debug(r_eef_pos, body_joints, max_reach_world, "APPROACH_BIN")
+            if dist < 0.06 or self.phase_step > 300:
                 self._next_phase("RELEASE_BIN")
 
         elif self.phase == "RELEASE_BIN":
