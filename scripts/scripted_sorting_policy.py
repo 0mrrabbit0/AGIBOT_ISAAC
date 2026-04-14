@@ -1,0 +1,632 @@
+"""
+ScriptedSortingPolicy - Hardcoded policy for sorting_packages task.
+
+State machine policy that controls the G2 robot to:
+1. Pick up a target carton from the table (right arm)
+2. Place it on the scanner (barcode up)
+3. Re-pick from scanner
+4. Place in the bin (drop strategy since bin is beyond arm reach)
+
+Uses body FK for coordinate transforms and IK solver for arm control.
+"""
+
+import numpy as np
+from collections import deque
+
+try:
+    from scipy.spatial.transform import Rotation as R
+except ImportError:
+    R = None
+
+# Try importing benchmark base
+try:
+    from geniesim.benchmark.policy.base import BasePolicy
+except ImportError:
+    class BasePolicy:
+        def __init__(self, task_name="", sub_task_name=""):
+            self.task_name = task_name
+            self.sub_task_name = sub_task_name
+            self.action_buffer = deque()
+        def reset(self): pass
+        def need_infer(self): return len(self.action_buffer) == 0
+        def act(self, observations, **kwargs): pass
+        def set_data_courier(self, dc): self.data_courier = dc
+
+
+class ScriptedSortingPolicy(BasePolicy):
+    """Hardcoded state-machine policy for sorting_packages."""
+
+    # ── Robot constants ──────────────────────────────────────────────
+    ROBOT_BASE = np.array([0.24469, 0.09325, 0.0])
+
+    # G2_STATES_4 initial values
+    INIT_BODY = np.array([1.57, 0.0, -0.31939525311, 1.34390352404, -1.04545222194])
+    INIT_LEFT_ARM = np.array([0.739033, -0.717023, -1.524419, -1.537612, 0.27811, -0.925845, -0.839257])
+    INIT_RIGHT_ARM = np.array([-0.739033, -0.717023, 1.524419, -1.537612, -0.27811, -0.925845, 0.839257])
+
+    # Right arm joint limits (from URDF)
+    RIGHT_ARM_LOWER = np.array([-3.1067, -2.0944, -3.1067, -2.5307, -3.1067, -1.0472, -3.1067])
+    RIGHT_ARM_UPPER = np.array([3.1067, 2.0944, 3.1067, 1.0472, 3.1067, 1.0472, 3.1067])
+
+    # Gripper offset: distance from arm_r_end_link (FK point) to gripper center
+    GRIPPER_Z_OFFSET = 0.143
+
+    # ── Scene positions (world frame) ────────────────────────────────
+    SCANNER_POS = np.array([0.929, 0.0, 1.163])
+    BIN_POS = np.array([0.300, -0.917, 0.837])
+
+    # Target carton world positions per variant
+    CARTON_POSITIONS = {
+        0: np.array([0.017, 0.613, 1.19]),     # yellow package
+        1: np.array([0.467, 0.59, 1.158]),      # black package
+    }
+
+    # Map instruction keywords to variant
+    INSTRUCTION_TO_VARIANT = {
+        "yellow": 0,
+        "black": 1,
+    }
+
+    # ── Optimal body_joint5 values for facing each target ────────────
+    BJ5_TABLE = 2.0        # face toward table (left side)
+    BJ5_SCANNER = -1.045   # face toward scanner (forward-right)
+    BJ5_BIN = -2.0         # face toward bin (right side)
+
+    # ── URDF body chain parameters ───────────────────────────────────
+    BODY_JOINTS_URDF = [
+        ([0.102, 0, 0.144],      'y',  1),   # joint1
+        ([-0.32627, 0, 0.15214], 'y',  1),   # joint2
+        ([0.22875, -0.0019, 0],  'x',  1),   # joint3
+        ([0.17625, 0.0019, 0],   'y', -1),   # joint4
+        ([0.0002112, -0.0024, 0.14475], 'z', 1),  # joint5
+    ]
+    ARM_BASE_ORIGIN = np.array([0.0, 0.0, 0.3085])
+    ARM_BASE_RPY = np.array([-np.pi / 2, 0, 0])
+
+    def __init__(self, task_name="", sub_task_name=""):
+        super().__init__(task_name=task_name, sub_task_name=sub_task_name)
+
+        self.ikfk_solver = None
+        try:
+            from geniesim.utils.ikfk_utils import IKFKSolver
+            arm_init = np.concatenate([self.INIT_LEFT_ARM, self.INIT_RIGHT_ARM])
+            self.ikfk_solver = IKFKSolver(
+                arm_init.tolist(), [0, 0, 0],
+                self.INIT_BODY.tolist(),
+                robot_cfg="G2_omnipicker",
+            )
+            print("[ScriptedPolicy] IK/FK solver initialized")
+        except Exception as e:
+            print(f"[ScriptedPolicy] IK solver not available: {e}")
+
+        self.variant = 0
+        self._detect_variant = True
+        self._init_eef_logged = False
+        self.reset()
+
+    # ── Reset ────────────────────────────────────────────────────────
+    def reset(self):
+        self.step_count = 0
+        self.phase = "INIT"
+        self.phase_step = 0
+        self.right_grip = 0.0   # 0=open, 1=close
+        self.last_right_arm = self.INIT_RIGHT_ARM.copy()
+        self.target_bj5 = self.INIT_BODY[4]
+        self._detect_variant = True
+        self._init_eef_logged = False
+        return None
+
+    # ── Rotation helpers ─────────────────────────────────────────────
+    @staticmethod
+    def _rot(axis, angle):
+        c, s = np.cos(angle), np.sin(angle)
+        if axis == 'x':
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        elif axis == 'y':
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        else:  # z
+            return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    # ── Body forward kinematics ──────────────────────────────────────
+    def body_fk(self, body_joints):
+        """Compute 4x4 transform from robot base_link to arm_base_link."""
+        bj = list(body_joints)
+        rot = np.eye(3)
+        pos = np.zeros(3)
+
+        for i, (origin, axis, sign) in enumerate(self.BODY_JOINTS_URDF):
+            pos += rot @ np.array(origin)
+            rot = rot @ self._rot(axis, sign * bj[i])
+
+        pos += rot @ self.ARM_BASE_ORIGIN
+        rot = rot @ self._rot('x', self.ARM_BASE_RPY[0])
+
+        T = np.eye(4)
+        T[:3, :3] = rot
+        T[:3, 3] = pos
+        return T
+
+    def _get_world_to_arm_T(self, body_joints):
+        """Get the full world-to-arm_base_link transform matrix."""
+        T_base_to_arm = self.body_fk(body_joints)
+        T_world = np.eye(4)
+        T_world[:3, 3] = self.ROBOT_BASE
+        T_world = T_world @ T_base_to_arm
+        return T_world
+
+    def world_to_arm_base(self, world_pos, body_joints):
+        """Convert world position to arm_base_link frame."""
+        T_world = self._get_world_to_arm_T(body_joints)
+        T_inv = np.linalg.inv(T_world)
+        p = T_inv @ np.append(world_pos, 1.0)
+        return p[:3]
+
+    def arm_base_to_world(self, local_pos, body_joints):
+        """Convert arm_base_link position to world frame."""
+        T_world = self._get_world_to_arm_T(body_joints)
+        p = T_world @ np.append(local_pos, 1.0)
+        return p[:3]
+
+    # ── IK helper ────────────────────────────────────────────────────
+    def _compute_right_ik(self, target_pos, target_rpy, current_arm_14, n_iter=10):
+        """Compute right arm joints via IK solver with multiple iterations.
+        The solver has a 5ms timeout per call, so we repeat n_iter times
+        for convergence. Returns 14-dim or None."""
+        if self.ikfk_solver is None:
+            return None
+        try:
+            left_eef = self.ikfk_solver.compute_eef(current_arm_14)
+            lp = left_eef["left"][:3]
+            lq = left_eef["left"][3:7]  # qw, qx, qy, qz
+            if R is not None:
+                lr = R.from_quat([lq[1], lq[2], lq[3], lq[0]]).as_euler('xyz')
+            else:
+                lr = [0, 0, 0]
+            left_xyzrpy = np.concatenate([lp, lr])
+
+            right_xyzrpy = np.concatenate([target_pos, target_rpy])
+            eef_action = np.concatenate([left_xyzrpy, right_xyzrpy, [0.0, 0.0]])
+
+            # Repeat same action n_iter times for solver convergence
+            eef_actions = [eef_action] * n_iter
+            result = self.ikfk_solver.eef_actions_to_joint(
+                eef_actions, current_arm_14, [0, 0]
+            )
+            joints_14 = np.array(result[-1][:14])  # take last (most converged)
+
+            right = joints_14[7:14]
+            right = np.clip(right, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
+            joints_14[7:14] = right
+            return joints_14
+        except Exception as e:
+            print(f"[IK] Error: {e}")
+            return None
+
+    def _get_right_eef_rpy(self, eef_quat):
+        """Convert qw,qx,qy,qz to roll,pitch,yaw."""
+        if R is not None:
+            qw, qx, qy, qz = eef_quat
+            return R.from_quat([qx, qy, qz, qw]).as_euler('xyz')
+        return np.array([0, 0, 0])
+
+    # ── Smooth interpolation ─────────────────────────────────────────
+    @staticmethod
+    def _lerp(current, target, alpha):
+        return current + alpha * (target - current)
+
+    @staticmethod
+    def _smooth_bj5(current_bj5, target_bj5, max_speed=0.04):
+        """Smoothly move bj5 toward target with speed limit (rad/step)."""
+        diff = target_bj5 - current_bj5
+        if abs(diff) > max_speed:
+            diff = max_speed * np.sign(diff)
+        return current_bj5 + diff
+
+    # ── Move right arm toward EEF target ─────────────────────────────
+    def _move_right_toward(self, target_pos_local, current_eef_pos, current_eef_quat,
+                           current_arm_14, step_size=0.015, target_rpy=None,
+                           n_iter=10):
+        """Move right EEF toward target_pos_local with small steps.
+        Returns (new_right_joints_7, distance_remaining)."""
+        error = target_pos_local - current_eef_pos
+        dist = np.linalg.norm(error)
+        if dist < 0.002:
+            return self.last_right_arm, dist
+
+        if dist > step_size:
+            direction = error / dist * step_size
+        else:
+            direction = error
+        next_pos = current_eef_pos + direction
+
+        if target_rpy is None:
+            target_rpy = self._get_right_eef_rpy(current_eef_quat)
+        result = self._compute_right_ik(next_pos, target_rpy, current_arm_14,
+                                         n_iter=n_iter)
+
+        if result is not None:
+            right_joints = result[7:14]
+            # Use IK result directly (multi-iteration already converges well)
+            right_joints = np.clip(right_joints, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
+            self.last_right_arm = right_joints.copy()
+            return right_joints, dist
+        return self.last_right_arm, dist
+
+    # ── Get current body joints from observation ─────────────────────
+    def _get_body_joints(self, states):
+        """Extract body joints from observation states.
+
+        PiEnv appends waist joints via G2_WAIST_JOINT_NAMES[::-1],
+        which yields order [bj1, bj2, bj3, bj4, bj5] at indices 16-20.
+        """
+        bj1 = states[16] if len(states) > 16 else self.INIT_BODY[0]
+        bj2 = states[17] if len(states) > 17 else self.INIT_BODY[1]
+        bj3 = states[18] if len(states) > 18 else self.INIT_BODY[2]
+        bj4 = states[19] if len(states) > 19 else self.INIT_BODY[3]
+        bj5 = states[20] if len(states) > 20 else self.INIT_BODY[4]
+        return np.array([bj1, bj2, bj3, bj4, bj5])
+
+    # ── Phase transition ─────────────────────────────────────────────
+    def _next_phase(self, phase_name):
+        print(f"[Policy] {self.phase} -> {phase_name} "
+              f"(step {self.step_count}, phase_steps={self.phase_step})")
+        self.phase = phase_name
+        self.phase_step = 0
+
+    # ── Variant detection ────────────────────────────────────────────
+    def _try_detect_variant(self, kwargs):
+        """Detect variant from task_instruction."""
+        instruction = kwargs.get("task_instruction", "")
+        if instruction:
+            lower = instruction.lower()
+            for keyword, var_id in self.INSTRUCTION_TO_VARIANT.items():
+                if keyword in lower:
+                    self.variant = var_id
+                    print(f"[Policy] Detected variant {var_id} from instruction "
+                          f"(keyword: '{keyword}')")
+                    break
+            else:
+                print(f"[Policy] No variant keyword found in instruction, "
+                      f"defaulting to variant {self.variant}")
+        else:
+            print(f"[Policy] No task_instruction provided, "
+                  f"defaulting to variant {self.variant}")
+
+        carton_pos = self.CARTON_POSITIONS.get(self.variant,
+                                                self.CARTON_POSITIONS[0])
+        print(f"[Policy] Target carton world position: {carton_pos}")
+
+    # ── Build default action ─────────────────────────────────────────
+    def _default_action(self, left_arm, right_arm, bj5):
+        """Build a default hold-position action."""
+        action = np.zeros(21)
+        action[:7] = left_arm
+        action[7:14] = right_arm
+        action[14] = 0.0            # left gripper open
+        action[15] = self.right_grip
+        action[20] = bj5
+        return action
+
+    # ── Main act method ──────────────────────────────────────────────
+    def act(self, observations, **kwargs):
+        self.step_count += 1
+        self.phase_step += 1
+
+        states = observations["states"]
+        eef = observations["eef"]
+
+        # Current state
+        left_arm = np.array(states[:7])
+        right_arm = np.array(states[7:14])
+        grip_r_state = states[15]  # 20=open, 120=closed
+        bj5 = states[20] if len(states) > 20 else self.INIT_BODY[4]
+
+        current_arm_14 = np.concatenate([left_arm, right_arm])
+        r_eef_pos = np.array(eef["right"][:3])
+        r_eef_quat = np.array(eef["right"][3:7])
+
+        body_joints = self._get_body_joints(states)
+
+        # Log initial EEF once for debugging
+        if not self._init_eef_logged:
+            self._init_eef_logged = True
+            r_eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
+            print(f"[Policy] Initial right EEF local: {r_eef_pos}")
+            print(f"[Policy] Initial right EEF world: {r_eef_world}")
+            print(f"[Policy] Initial right EEF quat: {r_eef_quat}")
+            print(f"[Policy] Initial bj5: {bj5}")
+            print(f"[Policy] Gripper state: {grip_r_state}")
+
+        # Detect variant on first call
+        if self._detect_variant:
+            self._detect_variant = False
+            self._try_detect_variant(kwargs)
+
+        # Build default action (hold everything)
+        action = self._default_action(left_arm, right_arm, bj5)
+
+        carton_pos = self.CARTON_POSITIONS.get(self.variant,
+                                                self.CARTON_POSITIONS[0])
+
+        # ── State machine ────────────────────────────────────────────
+
+        if self.phase == "INIT":
+            if self.phase_step >= 5:
+                self._next_phase("ROTATE_TO_TABLE")
+
+        elif self.phase == "ROTATE_TO_TABLE":
+            action[20] = self._smooth_bj5(bj5, self.BJ5_TABLE, 0.04)
+            if abs(bj5 - self.BJ5_TABLE) < 0.05 and self.phase_step > 20:
+                self._next_phase("APPROACH_ABOVE_CARTON")
+            elif self.phase_step > 120:
+                self._next_phase("APPROACH_ABOVE_CARTON")
+
+        elif self.phase == "APPROACH_ABOVE_CARTON":
+            action[20] = self.BJ5_TABLE
+            # Target: above carton. EEF should be above carton + gripper offset
+            target_world = carton_pos.copy()
+            target_world[2] += 0.15  # above carton
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.025
+            )
+            action[7:14] = new_joints
+            if self.phase_step % 50 == 0:
+                print(f"[Policy] APPROACH_ABOVE dist={dist:.4f}")
+            if dist < 0.04 or self.phase_step > 300:
+                self._next_phase("LOWER_TO_CARTON")
+
+        elif self.phase == "LOWER_TO_CARTON":
+            action[20] = self.BJ5_TABLE
+            # Lower EEF to carton level (gripper extends below EEF)
+            target_world = carton_pos.copy()
+            target_world[2] += 0.02  # slightly above carton center
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.012
+            )
+            action[7:14] = new_joints
+            if self.phase_step % 30 == 0:
+                print(f"[Policy] LOWER_TO dist={dist:.4f}")
+            if dist < 0.03 or self.phase_step > 200:
+                self._next_phase("GRASP_CARTON")
+
+        elif self.phase == "GRASP_CARTON":
+            action[20] = self.BJ5_TABLE
+            action[7:14] = self.last_right_arm  # hold position
+            self.right_grip = 1.0
+            action[15] = 1.0
+            if self.phase_step >= 35:
+                self._next_phase("LIFT_CARTON")
+
+        elif self.phase == "LIFT_CARTON":
+            action[20] = self.BJ5_TABLE
+            action[15] = 1.0
+            # Lift above carton position
+            target_world = carton_pos.copy()
+            target_world[2] += 0.22
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.018
+            )
+            action[7:14] = new_joints
+            if dist < 0.04 or self.phase_step > 100:
+                self._next_phase("RETRACT_FROM_TABLE")
+
+        elif self.phase == "RETRACT_FROM_TABLE":
+            action[20] = self.BJ5_TABLE
+            action[15] = 1.0
+            # Retract arm toward body before rotating waist
+            target_world = carton_pos.copy()
+            target_world[2] += 0.28
+            # Move XY toward robot base to clear table
+            to_robot = self.ROBOT_BASE[:2] - target_world[:2]
+            to_robot_norm = to_robot / (np.linalg.norm(to_robot) + 1e-8)
+            target_world[:2] += to_robot_norm * 0.18
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.018
+            )
+            action[7:14] = new_joints
+            if dist < 0.05 or self.phase_step > 80:
+                self._next_phase("ROTATE_TO_SCANNER")
+
+        elif self.phase == "ROTATE_TO_SCANNER":
+            action[20] = self._smooth_bj5(bj5, self.BJ5_SCANNER, 0.035)
+            action[15] = 1.0
+            action[7:14] = self.last_right_arm
+            if abs(bj5 - self.BJ5_SCANNER) < 0.05 and self.phase_step > 20:
+                self._next_phase("APPROACH_SCANNER")
+            elif self.phase_step > 150:
+                self._next_phase("APPROACH_SCANNER")
+
+        elif self.phase == "APPROACH_SCANNER":
+            action[20] = self.BJ5_SCANNER
+            action[15] = 1.0
+            # Target: above scanner
+            target_world = self.SCANNER_POS.copy()
+            target_world[2] += 0.15
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.022
+            )
+            action[7:14] = new_joints
+            if self.phase_step % 50 == 0:
+                print(f"[Policy] APPROACH_SCANNER dist={dist:.4f}")
+            if dist < 0.04 or self.phase_step > 300:
+                self._next_phase("LOWER_TO_SCANNER")
+
+        elif self.phase == "LOWER_TO_SCANNER":
+            action[20] = self.BJ5_SCANNER
+            action[15] = 1.0
+            # Lower onto scanner surface
+            target_world = self.SCANNER_POS.copy()
+            target_world[2] += 0.03  # slightly above scanner center
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.008
+            )
+            action[7:14] = new_joints
+            if dist < 0.03 or self.phase_step > 150:
+                self._next_phase("RELEASE_SCANNER")
+
+        elif self.phase == "RELEASE_SCANNER":
+            action[20] = self.BJ5_SCANNER
+            action[7:14] = self.last_right_arm
+            self.right_grip = 0.0
+            action[15] = 0.0
+            if self.phase_step >= 30:
+                self._next_phase("LIFT_FROM_SCANNER_PRE")
+
+        elif self.phase == "LIFT_FROM_SCANNER_PRE":
+            action[20] = self.BJ5_SCANNER
+            action[15] = 0.0
+            # Lift slightly to let carton settle on scanner
+            target_world = self.SCANNER_POS.copy()
+            target_world[2] += 0.13
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.012
+            )
+            action[7:14] = new_joints
+            if dist < 0.04 or self.phase_step > 80:
+                self._next_phase("WAIT_SETTLE")
+
+        elif self.phase == "WAIT_SETTLE":
+            # Wait for carton to settle on scanner (Inside+Upright check)
+            action[20] = self.BJ5_SCANNER
+            action[15] = 0.0
+            action[7:14] = self.last_right_arm
+            if self.phase_step >= 90:  # enough for 2+ evaluation checks at 30-step interval
+                self._next_phase("LOWER_REGRASP")
+
+        elif self.phase == "LOWER_REGRASP":
+            action[20] = self.BJ5_SCANNER
+            action[15] = 0.0
+            # Lower back to scanner to re-pick
+            target_world = self.SCANNER_POS.copy()
+            target_world[2] += 0.03
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.010
+            )
+            action[7:14] = new_joints
+            if dist < 0.03 or self.phase_step > 120:
+                self._next_phase("REGRASP_SCANNER")
+
+        elif self.phase == "REGRASP_SCANNER":
+            action[20] = self.BJ5_SCANNER
+            action[7:14] = self.last_right_arm
+            self.right_grip = 1.0
+            action[15] = 1.0
+            if self.phase_step >= 35:
+                self._next_phase("LIFT_FROM_SCANNER")
+
+        elif self.phase == "LIFT_FROM_SCANNER":
+            action[20] = self.BJ5_SCANNER
+            action[15] = 1.0
+            target_world = self.SCANNER_POS.copy()
+            target_world[2] += 0.22
+            target_local = self.world_to_arm_base(target_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.018
+            )
+            action[7:14] = new_joints
+            if dist < 0.05 or self.phase_step > 100:
+                self._next_phase("ROTATE_TO_BIN")
+
+        elif self.phase == "ROTATE_TO_BIN":
+            action[20] = self._smooth_bj5(bj5, self.BJ5_BIN, 0.035)
+            action[15] = 1.0
+            action[7:14] = self.last_right_arm
+            if abs(bj5 - self.BJ5_BIN) < 0.05 and self.phase_step > 20:
+                self._next_phase("APPROACH_BIN")
+            elif self.phase_step > 100:
+                self._next_phase("APPROACH_BIN")
+
+        elif self.phase == "APPROACH_BIN":
+            action[20] = self.BJ5_BIN
+            action[15] = 1.0
+            # Bin is beyond arm reach (~1.13m vs ~1.03m max).
+            # Strategy: extend arm maximally toward bin, then release.
+            # Target a point between arm_base and bin, at max reach.
+            arm_world = self.arm_base_to_world(np.zeros(3), body_joints)
+            to_bin = self.BIN_POS - arm_world
+            to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
+            # Target at ~0.75m from arm_base in the bin direction (within reach)
+            max_reach_world = arm_world + to_bin_dir * 0.70
+            # Keep height above bin to drop from above
+            max_reach_world[2] = max(self.BIN_POS[2] + 0.20, max_reach_world[2])
+            target_local = self.world_to_arm_base(max_reach_world, body_joints)
+            new_joints, dist = self._move_right_toward(
+                target_local, r_eef_pos, r_eef_quat, current_arm_14,
+                step_size=0.022
+            )
+            action[7:14] = new_joints
+            if self.phase_step % 50 == 0:
+                eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
+                bin_dist = np.linalg.norm(eef_world - self.BIN_POS)
+                print(f"[Policy] APPROACH_BIN eef_dist_to_target={dist:.4f} "
+                      f"eef_to_bin={bin_dist:.4f}")
+            if dist < 0.06 or self.phase_step > 250:
+                self._next_phase("RELEASE_BIN")
+
+        elif self.phase == "RELEASE_BIN":
+            action[20] = self.BJ5_BIN
+            action[7:14] = self.last_right_arm
+            self.right_grip = 0.0
+            action[15] = 0.0
+            if self.phase_step >= 40:
+                self._next_phase("RETURN_WAIST")
+
+        elif self.phase == "RETURN_WAIST":
+            action[20] = self._smooth_bj5(bj5, self.INIT_BODY[4], 0.035)
+            action[15] = 0.0
+            action[7:14] = self.last_right_arm
+            if abs(bj5 - self.INIT_BODY[4]) < 0.1 and self.phase_step > 20:
+                self._next_phase("DONE")
+            elif self.phase_step > 100:
+                self._next_phase("DONE")
+
+        elif self.phase == "DONE":
+            action[20] = self.INIT_BODY[4]
+            action[15] = 0.0
+            action[7:14] = self.last_right_arm
+
+        return action
+
+
+# ── Standalone test (outside Docker) ──────────────────────────────────
+if __name__ == "__main__":
+    policy = ScriptedSortingPolicy()
+
+    print("=== Body FK Test ===")
+    T = policy.body_fk(policy.INIT_BODY)
+    arm_base_world = T[:3, 3] + policy.ROBOT_BASE
+    print(f"arm_base_link world position (init): {arm_base_world}")
+    print(f"arm_base_link rotation:\n{T[:3, :3]}")
+
+    print("\n=== Reachability at different bj5 values ===")
+    for bj5_val in [-2.0, -1.045, 0.0, 2.0]:
+        body = policy.INIT_BODY.copy()
+        body[4] = bj5_val
+        T = policy.body_fk(body)
+        arm_pos = T[:3, 3] + policy.ROBOT_BASE
+
+        for name, world_pos in [("carton_v0", policy.CARTON_POSITIONS[0]),
+                                  ("carton_v1", policy.CARTON_POSITIONS[1]),
+                                  ("scanner", policy.SCANNER_POS),
+                                  ("bin", policy.BIN_POS)]:
+            local = policy.world_to_arm_base(world_pos, body)
+            print(f"  bj5={bj5_val:+.2f} | {name:10s} local={local} "
+                  f"dist={np.linalg.norm(local):.3f}")
+        print()
