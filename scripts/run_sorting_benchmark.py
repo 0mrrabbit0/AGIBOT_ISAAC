@@ -329,6 +329,47 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                         self.policy.set_carton_positions(carton_positions)
                         print(f"[Patch] Passed {len(carton_positions)} carton positions to policy")
 
+                # ── Query scanner & bin world positions ──
+                scanner_pos = None
+                bin_pos = None
+                _scanner_path = "/World/background/benchmark_scanner_000"
+                _bin_path = "/World/background/benchmark_material_tray_000"
+                try:
+                    for prim_path, label in [
+                        (_scanner_path, "scanner"),
+                        (_bin_path, "bin"),
+                    ]:
+                        pos, rot = self.api_core.get_obj_world_pose(prim_path)
+                        world_pos = [float(pos[0]), float(pos[1]), float(pos[2])]
+                        print(f"[Patch] {label}: world={world_pos}")
+                        if label == "scanner":
+                            scanner_pos = world_pos
+                        else:
+                            bin_pos = world_pos
+                except Exception as e:
+                    print(f"[Patch] WARNING: failed to query scanner/bin: {e}")
+
+                # Pass all scene positions to the policy
+                if hasattr(self, 'policy') and self.policy is not None:
+                    if hasattr(self.policy, 'set_scene_positions'):
+                        # Find the target carton (first one, or the one
+                        # matching 028/020 type)
+                        target_carton_pos = None
+                        for name, pos in carton_positions.items():
+                            if "028" in name or "020" in name:
+                                target_carton_pos = pos
+                                break
+                        if target_carton_pos is None and carton_positions:
+                            target_carton_pos = next(
+                                iter(carton_positions.values())
+                            )
+                        if target_carton_pos is not None:
+                            self.policy.set_scene_positions(
+                                carton_pos=target_carton_pos,
+                                scanner_pos=scanner_pos or [0.929, 0.0, 1.163],
+                                bin_pos=bin_pos or [0.300, -0.917, 0.837],
+                            )
+
                 # Log all USD objects
                 if hasattr(self.api_core, 'usd_objects'):
                     obj_names = list(self.api_core.usd_objects.keys())
