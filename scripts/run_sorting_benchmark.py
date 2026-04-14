@@ -166,6 +166,102 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             "init_hand": [0.0, 0.0],
         }
 
+        def _spawn_cartons_from_scene_info(self, instance_id):
+            """Load cartons from scene_info.json and spawn via api_core.
+
+            Returns dict of {carton_id: world_position} for all spawned cartons.
+            """
+            import json as _json
+            import geniesim.utils.system_utils as _su
+
+            scene_info_path = os.path.join(
+                _su.benchmark_conf_path(), "llm_task",
+                self.args.sub_task_name, str(instance_id), "scene_info.json",
+            )
+            if not os.path.exists(scene_info_path):
+                print(f"[Spawn] scene_info.json NOT found: {scene_info_path}")
+                return {}
+
+            with open(scene_info_path) as f:
+                scene_info = _json.load(f)
+
+            layout = scene_info.get("layout", {})
+            print(f"[Spawn] scene_info.json has {len(layout)} objects")
+
+            carton_positions = {}
+            for obj_id, obj_data in layout.items():
+                if "carton" not in obj_id:
+                    continue
+
+                usd_name = obj_data.get("usd", "")
+                xyz = obj_data.get("xyz", [0, 0, 0])
+                xyzw = obj_data.get("xyzw", [0, 0, 0, 1])
+
+                # Convert xyzw quaternion to wxyz for Isaac Sim
+                quat_wxyz = [xyzw[3], xyzw[0], xyzw[1], xyzw[2]]
+
+                # USD path relative to assets dir
+                usd_path = f"objects/benchmark/carton/{usd_name}/Aligned.usda"
+
+                prim_path = f"/World/Objects/{obj_id}"
+
+                print(f"[Spawn] Adding {obj_id}: usd={usd_name} pos={xyz}")
+                try:
+                    self.api_core.add_usd_obj(
+                        usd_path=usd_path,
+                        prim_path=prim_path,
+                        label_name=obj_id,
+                        position=xyz,
+                        rotation=quat_wxyz,
+                        scale=[1.0, 1.0, 1.0],
+                        object_color=[1, 1, 1],
+                        object_material="general",
+                        object_mass=0.5,
+                    )
+                    carton_positions[obj_id] = xyz
+                except Exception as e:
+                    print(f"[Spawn] Failed to add {obj_id}: {e}")
+
+            import time as _time
+            _time.sleep(0.5)
+            return carton_positions
+
+        def _check_carton_prims(self):
+            """Check if carton prims exist in USD stage. Returns list of found prim paths."""
+            found = []
+            try:
+                stage = self.api_core._stage
+                if stage is None:
+                    print("[Check] No USD stage available")
+                    return found
+
+                # Check both possible parent paths
+                for parent in ["/Workspace/World/Objects", "/World/Objects"]:
+                    from pxr import Usd
+                    parent_prim = stage.GetPrimAtPath(parent)
+                    if parent_prim.IsValid():
+                        for child in parent_prim.GetChildren():
+                            name = child.GetName()
+                            if "carton" in name.lower():
+                                found.append(str(child.GetPath()))
+                print(f"[Check] Found {len(found)} carton prims: {found[:5]}...")
+            except Exception as e:
+                print(f"[Check] Error checking prims: {e}")
+            return found
+
+        def _query_carton_world_positions(self, prim_paths):
+            """Query actual world positions of carton prims."""
+            positions = {}
+            for prim_path in prim_paths:
+                try:
+                    pos, rot = self.api_core.get_obj_world_pose(prim_path)
+                    name = prim_path.split("/")[-1]
+                    positions[name] = [float(pos[0]), float(pos[1]), float(pos[2])]
+                    print(f"[Pos] {name}: world=({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})")
+                except Exception as e:
+                    print(f"[Pos] Failed to query {prim_path}: {e}")
+            return positions
+
         def _create_env_pi(self, episode_file, instance_id):
             original_arc = self.args.model_arc
             self.args.model_arc = "pi"
@@ -198,40 +294,55 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
             print(f"[Patch] create_env called: episode_file={episode_file}, "
                   f"instance_id={instance_id}")
-            print(f"[Patch] task_config keys: {list(self.task_config.keys())}")
-            if "robot" in self.task_config:
-                print(f"[Patch] robot config: {self.task_config['robot']}")
 
             _original_create_env(self, episode_file, instance_id)
             self.args.model_arc = original_arc
 
-            # Log scene loading results
+            # ── Post-creation: check/spawn cartons ──
             if hasattr(self, 'env') and self.env is not None:
-                env = self.env
-                print(f"[Patch] Environment created: {type(env).__name__}")
-                if hasattr(env, 'usd_objects'):
-                    obj_names = list(env.usd_objects.keys()) if env.usd_objects else []
-                    print(f"[Patch] USD objects in scene ({len(obj_names)}): {obj_names}")
-                if hasattr(env, 'object_names'):
-                    print(f"[Patch] object_names: {env.object_names}")
+                print(f"[Patch] Environment created: {type(self.env).__name__}")
+
+                # Check if cartons loaded from scene.usda
+                carton_prims = _check_carton_prims(self)
+                carton_positions = {}
+
+                if carton_prims:
+                    print(f"[Patch] Cartons found in scene.usda ({len(carton_prims)})")
+                    import time as _time
+                    _time.sleep(0.5)  # let scene settle
+                    carton_positions = _query_carton_world_positions(self, carton_prims)
+                else:
+                    print("[Patch] NO cartons in scene! Spawning from scene_info.json...")
+                    carton_positions = _spawn_cartons_from_scene_info(self, instance_id)
+                    # Re-check after spawning
+                    carton_prims = _check_carton_prims(self)
+                    if carton_prims:
+                        import time as _time
+                        _time.sleep(0.5)
+                        carton_positions = _query_carton_world_positions(self, carton_prims)
+                    else:
+                        print("[Patch] WARNING: Cartons still not found after spawning!")
+
+                # Pass carton positions to the policy
+                if hasattr(self, 'policy') and self.policy is not None:
+                    if hasattr(self.policy, 'set_carton_positions'):
+                        self.policy.set_carton_positions(carton_positions)
+                        print(f"[Patch] Passed {len(carton_positions)} carton positions to policy")
+
+                # Log all USD objects
+                if hasattr(self.api_core, 'usd_objects'):
+                    obj_names = list(self.api_core.usd_objects.keys())
+                    print(f"[Patch] All USD objects ({len(obj_names)}): {obj_names[:10]}")
             else:
                 print("[Patch] WARNING: env is None after create_env!")
 
         TaskBenchmark.create_env = _create_env_pi
 
-        # Also patch evaluate_policy to log episode info
+        # Also patch evaluate_policy to pass instruction to policy
         _original_evaluate = TaskBenchmark.evaluate_policy
 
         def _evaluate_debug(self, *args, **kwargs):
             print(f"[Patch] evaluate_policy called")
-            if hasattr(self, 'scene_instance_ids'):
-                print(f"[Patch] scene_instance_ids: {self.scene_instance_ids}")
-            if hasattr(self, 'task_generator') and self.task_generator is not None:
-                tg = self.task_generator
-                if hasattr(tg, 'episode_files'):
-                    print(f"[Patch] episode_files: {tg.episode_files}")
-                if hasattr(tg, 'num_episodes'):
-                    print(f"[Patch] num_episodes: {tg.num_episodes}")
             return _original_evaluate(self, *args, **kwargs)
 
         TaskBenchmark.evaluate_policy = _evaluate_debug

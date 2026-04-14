@@ -8,6 +8,8 @@ State machine policy that controls the G2 robot to:
 4. Place in the bin (drop strategy since bin is beyond arm reach)
 
 Uses body FK for coordinate transforms and IK solver for arm control.
+
+Set DIAG_MODE = True to run diagnostic hold-position tests first.
 """
 
 import numpy as np
@@ -36,6 +38,14 @@ except ImportError:
 class ScriptedSortingPolicy(BasePolicy):
     """Hardcoded state-machine policy for sorting_packages."""
 
+    # ── Diagnostic mode ─────────────────────────────────────────────
+    # When True: runs hold-position tests before normal operation.
+    # Set to False once diagnostics confirm arm holds correctly.
+    DIAG_MODE = True
+    DIAG_HOLD_STEPS = 100    # hold INIT_RIGHT_ARM constant
+    DIAG_ECHO_STEPS = 100    # echo observed joints back
+    DIAG_WAIST_STEPS = 200   # rotate waist while holding arm
+
     # ── Robot constants ──────────────────────────────────────────────
     ROBOT_BASE = np.array([0.24469, 0.09325, 0.0])
 
@@ -53,16 +63,16 @@ class ScriptedSortingPolicy(BasePolicy):
 
     # ── IK control parameters ────────────────────────────────────────
     JOINT_SMOOTH_ALPHA = 0.5   # blend factor: 0=keep current, 1=full IK
-    MAX_JOINT_DELTA = 0.15     # max joint change per step (rad)
-    IK_POS_TOLERANCE = 0.10    # max acceptable IK position error (m)
+    MAX_JOINT_DELTA = 0.10     # max joint change per step (rad)
+    IK_POS_TOLERANCE = 0.08    # max acceptable IK position error (m)
 
     # ── Scene positions (world frame) ────────────────────────────────
     SCANNER_POS = np.array([0.929, 0.0, 1.163])
     BIN_POS = np.array([0.300, -0.917, 0.837])
 
-    # Target carton world positions per variant
+    # Default carton world positions (will be overridden by runtime query)
     CARTON_POSITIONS = {
-        0: np.array([0.017, 0.613, 1.19]),     # yellow package
+        0: np.array([0.017, 0.613, 1.19]),     # blue/yellow package (scene_info)
         1: np.array([0.467, 0.59, 1.158]),      # black package
     }
 
@@ -70,6 +80,7 @@ class ScriptedSortingPolicy(BasePolicy):
     INSTRUCTION_TO_VARIANT = {
         "yellow": 0,
         "black": 1,
+        "blue": 0,
     }
 
     # ── Optimal body_joint5 values for facing each target ────────────
@@ -78,10 +89,6 @@ class ScriptedSortingPolicy(BasePolicy):
     BJ5_BIN = -2.0         # face toward bin (right side)
 
     # ── URDF body chain parameters ───────────────────────────────────
-    # Note: These were derived to match the simulation's FK. The raw URDF
-    # has slightly different xyz values and axis signs, but those don't
-    # account for the simulation's internal joint convention. These values
-    # produce correct arm_base_link positions (verified at z≈0.507m).
     BODY_JOINTS_URDF = [
         ([0.102, 0, 0.144],      'y',  1),   # bj1 - pitch
         ([-0.32627, 0, 0.15214], 'y',  1),   # bj2 - pitch
@@ -111,14 +118,51 @@ class ScriptedSortingPolicy(BasePolicy):
         self.variant = 0
         self._detect_variant = True
         self._init_eef_logged = False
-        self._init_eef_rpy = None  # cached initial EEF orientation
+        self._init_eef_rpy = None
         self._calibrated = False
+        self._runtime_carton_positions = {}  # from environment query
         self.reset()
+
+    # ── Accept dynamic carton positions from environment ─────────────
+    def set_carton_positions(self, positions):
+        """Called by the benchmark runner with actual carton world positions.
+
+        Args:
+            positions: dict of {carton_id: [x, y, z]}
+        """
+        self._runtime_carton_positions = positions
+        print(f"[Policy] Received {len(positions)} carton positions from environment")
+        for name, pos in positions.items():
+            print(f"  {name}: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+
+    def _get_target_carton_pos(self):
+        """Get the target carton world position, using runtime data if available."""
+        if self._runtime_carton_positions:
+            # Find closest carton matching our variant
+            # For now, use the first carton with "028" (blue/yellow) for variant 0
+            # or "020" for variant 1
+            target_type = "028" if self.variant == 0 else "020"
+            for name, pos in self._runtime_carton_positions.items():
+                if target_type in name:
+                    return np.array(pos)
+            # Fallback: use the closest carton on the "scattered" set
+            # (type_028, type_029, type_030, type_020)
+            scattered_types = ["028", "029", "030", "020"]
+            for name, pos in self._runtime_carton_positions.items():
+                for t in scattered_types:
+                    if t in name:
+                        return np.array(pos)
+            # Last fallback: first carton
+            first_pos = next(iter(self._runtime_carton_positions.values()))
+            return np.array(first_pos)
+
+        # No runtime data, use defaults
+        return self.CARTON_POSITIONS.get(self.variant, self.CARTON_POSITIONS[0]).copy()
 
     # ── Reset ────────────────────────────────────────────────────────
     def reset(self):
         self.step_count = 0
-        self.phase = "INIT"
+        self.phase = "DIAG_HOLD" if self.DIAG_MODE else "INIT"
         self.phase_step = 0
         self.right_grip = 0.0   # 0=open, 1=close
         self.last_right_arm = self.INIT_RIGHT_ARM.copy()
@@ -126,6 +170,7 @@ class ScriptedSortingPolicy(BasePolicy):
         self._detect_variant = True
         self._init_eef_logged = False
         self._calibrated = False
+        self._diag_init_obs_arm = None  # observed arm at step 1
         return None
 
     # ── Rotation helpers ─────────────────────────────────────────────
@@ -181,15 +226,13 @@ class ScriptedSortingPolicy(BasePolicy):
 
     # ── IK helper ────────────────────────────────────────────────────
     def _compute_right_ik(self, target_pos, target_rpy, current_arm_14, n_iter=10):
-        """Compute right arm joints via IK solver with multiple iterations.
-        The solver has a 5ms timeout per call, so we repeat n_iter times
-        for convergence. Returns 14-dim or None."""
+        """Compute right arm joints via IK solver with multiple iterations."""
         if self.ikfk_solver is None:
             return None
         try:
             left_eef = self.ikfk_solver.compute_eef(current_arm_14)
             lp = left_eef["left"][:3]
-            lq = left_eef["left"][3:7]  # qw, qx, qy, qz
+            lq = left_eef["left"][3:7]
             if R is not None:
                 lr = R.from_quat([lq[1], lq[2], lq[3], lq[0]]).as_euler('xyz')
             else:
@@ -199,12 +242,11 @@ class ScriptedSortingPolicy(BasePolicy):
             right_xyzrpy = np.concatenate([target_pos, target_rpy])
             eef_action = np.concatenate([left_xyzrpy, right_xyzrpy, [0.0, 0.0]])
 
-            # Repeat same action n_iter times for solver convergence
             eef_actions = [eef_action] * n_iter
             result = self.ikfk_solver.eef_actions_to_joint(
                 eef_actions, current_arm_14, [0, 0]
             )
-            joints_14 = np.array(result[-1][:14])  # take last (most converged)
+            joints_14 = np.array(result[-1][:14])
 
             right = joints_14[7:14]
             right = np.clip(right, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
@@ -223,10 +265,6 @@ class ScriptedSortingPolicy(BasePolicy):
 
     # ── Smooth interpolation ─────────────────────────────────────────
     @staticmethod
-    def _lerp(current, target, alpha):
-        return current + alpha * (target - current)
-
-    @staticmethod
     def _smooth_bj5(current_bj5, target_bj5, max_speed=0.04):
         """Smoothly move bj5 toward target with speed limit (rad/step)."""
         diff = target_bj5 - current_bj5
@@ -239,9 +277,6 @@ class ScriptedSortingPolicy(BasePolicy):
                            current_arm_14, step_size=0.015, target_rpy=None,
                            n_iter=10):
         """Move right EEF toward target_pos_local with small steps.
-
-        Uses joint-space smoothing and convergence verification to prevent
-        erratic arm movements from IK instability.
 
         Returns (new_right_joints_7, distance_remaining).
         """
@@ -256,7 +291,6 @@ class ScriptedSortingPolicy(BasePolicy):
             direction = error
         next_pos = current_eef_pos + direction
 
-        # Use initial EEF orientation if available (more stable than current)
         if target_rpy is None:
             if self._init_eef_rpy is not None:
                 target_rpy = self._init_eef_rpy.copy()
@@ -270,29 +304,23 @@ class ScriptedSortingPolicy(BasePolicy):
             ik_right = result[7:14]
             ik_right = np.clip(ik_right, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
 
-            # ── IK convergence check ──
-            # Verify the IK result's FK matches the target
+            # IK convergence check
             ik_arm_14 = np.concatenate([current_arm_14[:7], ik_right])
             ik_eef = self.ikfk_solver.compute_eef(ik_arm_14)
             ik_eef_pos = np.array(ik_eef["right"][:3])
             ik_error = np.linalg.norm(ik_eef_pos - next_pos)
 
             if ik_error > self.IK_POS_TOLERANCE:
-                # IK didn't converge well — use smaller step or hold
                 if self.step_count % 30 == 0:
                     print(f"[IK] Poor convergence: ik_err={ik_error:.4f} "
                           f"(tol={self.IK_POS_TOLERANCE}), holding position")
                 return self.last_right_arm, dist
 
-            # ── Joint-space smoothing ──
-            # Blend IK result with current joints to prevent jumps
+            # Joint-space smoothing
             current_right = current_arm_14[7:14]
             delta = ik_right - current_right
-            # Clamp per-joint delta
             delta = np.clip(delta, -self.MAX_JOINT_DELTA, self.MAX_JOINT_DELTA)
-            # Apply alpha blending
             smoothed = current_right + self.JOINT_SMOOTH_ALPHA * delta
-
             smoothed = np.clip(smoothed, self.RIGHT_ARM_LOWER, self.RIGHT_ARM_UPPER)
             self.last_right_arm = smoothed.copy()
             return smoothed, dist
@@ -303,7 +331,7 @@ class ScriptedSortingPolicy(BasePolicy):
         """Extract body joints from observation states.
 
         PiEnv appends waist joints via G2_WAIST_JOINT_NAMES[::-1],
-        which yields order [bj1, bj2, bj3, bj4, bj5] at indices 16-20.
+        yielding order [bj1, bj2, bj3, bj4, bj5] at indices 16-20.
         """
         bj1 = states[16] if len(states) > 16 else self.INIT_BODY[0]
         bj2 = states[17] if len(states) > 17 else self.INIT_BODY[1]
@@ -332,14 +360,13 @@ class ScriptedSortingPolicy(BasePolicy):
                           f"(keyword: '{keyword}')")
                     break
             else:
-                print(f"[Policy] No variant keyword found in instruction, "
+                print(f"[Policy] No variant keyword found, "
                       f"defaulting to variant {self.variant}")
         else:
-            print(f"[Policy] No task_instruction provided, "
+            print(f"[Policy] No task_instruction, "
                   f"defaulting to variant {self.variant}")
 
-        carton_pos = self.CARTON_POSITIONS.get(self.variant,
-                                                self.CARTON_POSITIONS[0])
+        carton_pos = self._get_target_carton_pos()
         print(f"[Policy] Target carton world position: {carton_pos}")
 
     # ── Build default action ─────────────────────────────────────────
@@ -373,6 +400,19 @@ class ScriptedSortingPolicy(BasePolicy):
             msg += f" [{label}]"
         print(msg)
 
+    # ── Diagnostic logging (per step) ────────────────────────────────
+    def _log_diag(self, phase, obs_right, cmd_right, bj5, eef_pos):
+        """Log observed vs commanded arm joints every 10 steps during diagnostics."""
+        if self.step_count % 10 != 0:
+            return
+        diff = np.array(obs_right) - np.array(cmd_right)
+        max_diff = np.max(np.abs(diff))
+        print(f"[DIAG s={self.step_count}] phase={phase} bj5={bj5:.4f}")
+        print(f"  obs_arm: [{', '.join(f'{v:.5f}' for v in obs_right)}]")
+        print(f"  cmd_arm: [{', '.join(f'{v:.5f}' for v in cmd_right)}]")
+        print(f"  diff:    [{', '.join(f'{v:.5f}' for v in diff)}]  max={max_diff:.5f}")
+        print(f"  eef_pos: [{eef_pos[0]:.4f}, {eef_pos[1]:.4f}, {eef_pos[2]:.4f}]")
+
     # ── Main act method ──────────────────────────────────────────────
     def act(self, observations, **kwargs):
         self.step_count += 1
@@ -384,7 +424,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Current state
         left_arm = np.array(states[:7])
         right_arm = np.array(states[7:14])
-        grip_r_state = states[15]  # 20=open, 120=closed
+        grip_r_state = states[15]
         bj5 = states[20] if len(states) > 20 else self.INIT_BODY[4]
 
         current_arm_14 = np.concatenate([left_arm, right_arm])
@@ -393,16 +433,22 @@ class ScriptedSortingPolicy(BasePolicy):
 
         body_joints = self._get_body_joints(states)
 
-        # ── Initial calibration logging ──
+        # ── Initial calibration logging (step 1) ──
         if not self._init_eef_logged:
             self._init_eef_logged = True
+            self._diag_init_obs_arm = right_arm.copy()
             r_eef_world = self.arm_base_to_world(r_eef_pos, body_joints)
             arm_base_world = self.arm_base_to_world(np.zeros(3), body_joints)
-            print("=" * 60)
+            print("=" * 70)
             print("[CALIBRATION] Initial state at step 1:")
             print(f"  states length: {len(states)}")
-            print(f"  body_joints: {body_joints}")
-            print(f"  right_arm joints: {right_arm}")
+            print(f"  body_joints (observed): {body_joints}")
+            print(f"  body_joints (expected): {self.INIT_BODY}")
+            print(f"  right_arm (observed): {right_arm}")
+            print(f"  right_arm (expected): {self.INIT_RIGHT_ARM}")
+            arm_diff = right_arm - self.INIT_RIGHT_ARM
+            print(f"  right_arm diff:       {arm_diff}")
+            print(f"  right_arm max diff:   {np.max(np.abs(arm_diff)):.6f}")
             print(f"  right EEF local (arm_base frame): {r_eef_pos}")
             print(f"  right EEF world (computed): {r_eef_world}")
             print(f"  right EEF quat: {r_eef_quat}")
@@ -410,42 +456,112 @@ class ScriptedSortingPolicy(BasePolicy):
             print(f"  bj5: {bj5}")
             print(f"  gripper state: {grip_r_state}")
 
-            # Cache initial EEF orientation for stable IK
+            # Cache initial EEF orientation
             self._init_eef_rpy = self._get_right_eef_rpy(r_eef_quat)
             print(f"  init EEF RPY: {self._init_eef_rpy}")
 
-            # Show distances to all targets from current arm_base
-            for name, pos in [("carton_v0", self.CARTON_POSITIONS[0]),
-                              ("carton_v1", self.CARTON_POSITIONS[1]),
-                              ("scanner", self.SCANNER_POS),
+            # Show distances to all targets
+            for name, pos in [("scanner", self.SCANNER_POS),
                               ("bin", self.BIN_POS)]:
                 local = self.world_to_arm_base(pos, body_joints)
                 print(f"  {name}: world={pos} local={local} "
                       f"dist={np.linalg.norm(local):.3f}")
-            print("=" * 60)
+
+            # Show carton positions
+            carton_pos = self._get_target_carton_pos()
+            local = self.world_to_arm_base(carton_pos, body_joints)
+            print(f"  target_carton: world={carton_pos} local={local} "
+                  f"dist={np.linalg.norm(local):.3f}")
+
+            if self._runtime_carton_positions:
+                print(f"  Runtime carton positions ({len(self._runtime_carton_positions)}):")
+                for name, pos in self._runtime_carton_positions.items():
+                    local_c = self.world_to_arm_base(np.array(pos), body_joints)
+                    print(f"    {name}: world={pos} local=[{local_c[0]:.3f},{local_c[1]:.3f},{local_c[2]:.3f}] "
+                          f"dist={np.linalg.norm(local_c):.3f}")
+            print("=" * 70)
 
         # Detect variant on first call
         if self._detect_variant:
             self._detect_variant = False
             self._try_detect_variant(kwargs)
 
+        # Get target carton position
+        carton_pos = self._get_target_carton_pos()
+
+        # ── DIAGNOSTIC PHASES ────────────────────────────────────────
+        if self.phase == "DIAG_HOLD":
+            # Hold constant INIT_RIGHT_ARM — test if arm drifts
+            cmd_right = self.INIT_RIGHT_ARM.copy()
+            action = self._default_action(left_arm, cmd_right, bj5)
+            action[20] = self.INIT_BODY[4]  # hold waist too
+            self._log_diag("DIAG_HOLD", right_arm, cmd_right, bj5, r_eef_pos)
+            if self.phase_step >= self.DIAG_HOLD_STEPS:
+                self._next_phase("DIAG_ECHO")
+            return action
+
+        elif self.phase == "DIAG_ECHO":
+            # Echo observed joints back — test if echo loop is stable
+            cmd_right = right_arm.copy()
+            action = self._default_action(left_arm, cmd_right, bj5)
+            action[20] = self.INIT_BODY[4]
+            self._log_diag("DIAG_ECHO", right_arm, cmd_right, bj5, r_eef_pos)
+            if self.phase_step >= self.DIAG_ECHO_STEPS:
+                self._next_phase("DIAG_WAIST")
+            return action
+
+        elif self.phase == "DIAG_WAIST":
+            # Hold arm constant while rotating waist — test coupling
+            cmd_right = self.INIT_RIGHT_ARM.copy()
+            target_bj5 = self.BJ5_TABLE
+            new_bj5 = self._smooth_bj5(bj5, target_bj5, 0.03)
+            action = self._default_action(left_arm, cmd_right, new_bj5)
+            self._log_diag("DIAG_WAIST", right_arm, cmd_right, bj5, r_eef_pos)
+
+            # After waist test, log FK at new position
+            if self.phase_step % 50 == 0:
+                arm_base_w = self.arm_base_to_world(np.zeros(3), body_joints)
+                carton_local = self.world_to_arm_base(carton_pos, body_joints)
+                print(f"[DIAG_WAIST s={self.step_count}] bj5={bj5:.4f} "
+                      f"arm_base_world=[{arm_base_w[0]:.3f},{arm_base_w[1]:.3f},{arm_base_w[2]:.3f}] "
+                      f"carton_local=[{carton_local[0]:.3f},{carton_local[1]:.3f},{carton_local[2]:.3f}] "
+                      f"carton_dist={np.linalg.norm(carton_local):.3f}")
+
+            if self.phase_step >= self.DIAG_WAIST_STEPS:
+                # Diagnostics complete — proceed to normal operation
+                print("[DIAG] Diagnostics complete. Starting normal operation.")
+                self._next_phase("INIT")
+            return action
+
+        # ── NORMAL OPERATION ─────────────────────────────────────────
+
         # Build default action (hold everything)
-        action = self._default_action(left_arm, right_arm, bj5)
-
-        carton_pos = self.CARTON_POSITIONS.get(self.variant,
-                                                self.CARTON_POSITIONS[0])
-
-        # ── State machine ────────────────────────────────────────────
+        action = self._default_action(left_arm, self.last_right_arm, bj5)
 
         if self.phase == "INIT":
-            if self.phase_step >= 5:
+            # Hold position with constant INIT joints for stability
+            action[7:14] = self.INIT_RIGHT_ARM
+            action[20] = bj5  # hold waist
+            if self.phase_step >= 30:
                 self._next_phase("ROTATE_TO_TABLE")
 
         elif self.phase == "ROTATE_TO_TABLE":
+            # Hold arm constant while rotating waist to face table
+            action[7:14] = self.INIT_RIGHT_ARM
             action[20] = self._smooth_bj5(bj5, self.BJ5_TABLE, 0.04)
+            self.last_right_arm = self.INIT_RIGHT_ARM.copy()
+
+            if self.step_count % 30 == 0:
+                arm_base_w = self.arm_base_to_world(np.zeros(3), body_joints)
+                carton_local = self.world_to_arm_base(carton_pos, body_joints)
+                print(f"[ROTATE s={self.step_count}] bj5={bj5:.4f}->{self.BJ5_TABLE:.2f} "
+                      f"arm_base=[{arm_base_w[0]:.3f},{arm_base_w[1]:.3f},{arm_base_w[2]:.3f}] "
+                      f"carton_local=[{carton_local[0]:.3f},{carton_local[1]:.3f},{carton_local[2]:.3f}] "
+                      f"dist={np.linalg.norm(carton_local):.3f}")
+
             if abs(bj5 - self.BJ5_TABLE) < 0.05 and self.phase_step > 20:
                 self._next_phase("APPROACH_ABOVE_CARTON")
-            elif self.phase_step > 120:
+            elif self.phase_step > 150:
                 self._next_phase("APPROACH_ABOVE_CARTON")
 
         elif self.phase == "APPROACH_ABOVE_CARTON":
@@ -478,7 +594,7 @@ class ScriptedSortingPolicy(BasePolicy):
 
         elif self.phase == "GRASP_CARTON":
             action[20] = self.BJ5_TABLE
-            action[7:14] = self.last_right_arm  # hold position
+            action[7:14] = self.last_right_arm
             self.right_grip = 1.0
             action[15] = 1.0
             if self.phase_step >= 35:
@@ -579,11 +695,10 @@ class ScriptedSortingPolicy(BasePolicy):
                 self._next_phase("WAIT_SETTLE")
 
         elif self.phase == "WAIT_SETTLE":
-            # Wait for carton to settle on scanner (Inside+Upright check)
             action[20] = self.BJ5_SCANNER
             action[15] = 0.0
             action[7:14] = self.last_right_arm
-            if self.phase_step >= 90:  # enough for 2+ evaluation checks at 30-step interval
+            if self.phase_step >= 90:
                 self._next_phase("LOWER_REGRASP")
 
         elif self.phase == "LOWER_REGRASP":
