@@ -153,9 +153,49 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
         _original_create_env = TaskBenchmark.create_env
 
+        # G2_STATES_4 init values for sorting_packages
+        _G2_STATES_4 = {
+            "body_state": [1.57, 0.0, -0.31939525311, 1.34390352404, -1.04545222194],
+            "head_state": [0.0, 0.0, 0.11464],
+            "init_arm": [
+                0.739033, -0.717023, -1.524419, -1.537612,
+                0.27811, -0.925845, -0.839257,
+                -0.739033, -0.717023, 1.524419, -1.537612,
+                -0.27811, -0.925845, 0.839257,
+            ],
+            "init_hand": [0.0, 0.0],
+        }
+
         def _create_env_pi(self, episode_file, instance_id):
             original_arc = self.args.model_arc
             self.args.model_arc = "pi"
+
+            # Ensure task_config has all keys BaseEnv expects
+            if "sub_task_name" not in self.task_config:
+                self.task_config["sub_task_name"] = self.args.sub_task_name
+            if "specific_task_name" not in self.task_config:
+                self.task_config["specific_task_name"] = self.args.task_name
+            if "robot_cfg" not in self.task_config:
+                robot_cfg = self.task_config.get("robot", {}).get(
+                    "robot_cfg", "G2_omnipicker.json"
+                )
+                from geniesim.utils.name_utils import robot_type_mapping
+                self.task_config["robot_cfg"] = robot_type_mapping(
+                    robot_cfg.split(".")[0]
+                )
+
+            # Inject G2_STATES_4 into TASK_INFO_DICT if missing
+            try:
+                from geniesim.benchmark.config.robot_init_states import TASK_INFO_DICT
+                sub = self.args.sub_task_name
+                if sub not in TASK_INFO_DICT:
+                    TASK_INFO_DICT[sub] = {}
+                if "G2_omnipicker" not in TASK_INFO_DICT[sub]:
+                    TASK_INFO_DICT[sub]["G2_omnipicker"] = _G2_STATES_4
+                    print(f"[Patch] Injected G2_STATES_4 into TASK_INFO_DICT[{sub}]")
+            except ImportError:
+                pass
+
             _original_create_env(self, episode_file, instance_id)
             self.args.model_arc = original_arc
 
