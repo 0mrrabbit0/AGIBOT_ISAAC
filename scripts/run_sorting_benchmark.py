@@ -256,4 +256,18 @@ os.chdir(app_dir)
 sys.modules["__main__"].__file__ = app_py
 
 # Execute app.py in the current process
-exec(compile(open(app_py).read(), app_py, "exec"))
+# Patch the source to force-disable ROS (rclpy) even if config defaults
+# have enable_ros=true. The CLI args --app.enable_ros false may not
+# override correctly depending on the config parser version.
+import re
+app_source = open(app_py).read()
+# Replace the ROS conditional block: force rclpy = None
+app_source = re.sub(
+    r'if\s+cfg\.app\.enable_ros\s+or\s+cfg\.benchmark\.enable_ros\s*:.*?'
+    r'(?=\nelse:)',
+    'if False:  # PATCHED: ROS disabled\n    pass',
+    app_source,
+    flags=re.DOTALL,
+)
+print("[Run] Patched app.py source to disable ROS/rclpy")
+exec(compile(app_source, app_py, "exec"))
