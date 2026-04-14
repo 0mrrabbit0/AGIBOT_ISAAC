@@ -449,10 +449,7 @@ class ScriptedSortingPolicy(BasePolicy):
         instruction = kwargs.get("task_instruction", "")
         if self.step_count == 1 and instruction:
             self._resolve_carton_from_instruction(instruction)
-            # Recompute bj5 for table if carton was just resolved
-            if self._carton_pos is not None and self._bj5_table is None:
-                self._bj5_table = self._compute_bj5_for_target(self._carton_pos)
-                print(f"[Policy] bj5_table computed: {self._bj5_table:.3f}")
+            # No bj5 rotation needed for approach — carton is in front
 
         # Fallback positions if not set
         if self._carton_pos is None:
@@ -493,24 +490,16 @@ class ScriptedSortingPolicy(BasePolicy):
         return action
 
     # ════════════════════════════════════════════════════════════════
-    #  PHASE 1: APPROACH — rotate to table, move above carton
+    #  PHASE 1: APPROACH — move EEF above carton (no waist rotation)
     #    Eval trigger: Follow (gripper enters carton bbox)
+    #    The carton is already in front of the robot at init pose.
     # ════════════════════════════════════════════════════════════════
 
     def _phase_approach(self, obs: dict) -> np.ndarray:
-        bj5 = obs["bj5"]
+        # Keep current bj5 — carton is already in front, no rotation needed
+        bj5_hold = obs["bj5"]
 
-        # Sub-step 1: rotate waist to face table
-        if abs(bj5 - self._bj5_table) > 0.05 and self.sub_step < 200:
-            new_bj5 = self._smooth_bj5(bj5, self._bj5_table, self.BJ5_SPEED)
-            action = self._build_action(
-                obs["left_arm"], self.INIT_RIGHT_ARM, new_bj5,
-            )
-            self.last_right_arm = self.INIT_RIGHT_ARM.copy()
-            self._log(obs, self._carton_pos, "rotating_to_table")
-            return action
-
-        # Sub-step 2: move EEF above carton
+        # Move EEF above carton
         target_w = self._carton_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
         target_l = self.world_to_arm_base(target_w, obs["body"])
@@ -518,7 +507,7 @@ class ScriptedSortingPolicy(BasePolicy):
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
         )
-        action = self._build_action(obs["left_arm"], new_joints, self._bj5_table)
+        action = self._build_action(obs["left_arm"], new_joints, bj5_hold)
         self._log(obs, target_w, "above_carton")
 
         if dist < 0.04 or self.sub_step > 500:
@@ -531,7 +520,7 @@ class ScriptedSortingPolicy(BasePolicy):
     # ════════════════════════════════════════════════════════════════
 
     def _phase_grasp(self, obs: dict) -> np.ndarray:
-        bj5_hold = self._bj5_table
+        bj5_hold = obs["bj5"]  # keep current waist angle
 
         # Sub 1: lower to carton
         if self.right_grip < 0.5:
