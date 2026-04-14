@@ -395,6 +395,28 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     robot_base_z = 0.83  # estimated standing height
                     print(f"[Patch] Robot base z fallback: {robot_base_z}")
 
+                # ── BUG 9 probe: query known robot links ──
+                for probe_path in [
+                    "/Workspace/Robot/base_link",
+                    "/Workspace/Robot/right_arm_link7",
+                    "/Workspace/Robot/idx67_arm_r_link7",
+                ]:
+                    try:
+                        pos, _ = self.api_core.get_obj_world_pose(
+                            probe_path
+                        )
+                        print(f"[Probe] {probe_path}: "
+                              f"z={float(pos[2]):.4f}")
+                        # If base_link found, use its z directly
+                        if "base_link" in probe_path:
+                            robot_base_z = float(pos[2])
+                            print(f"[Probe] Using base_link z="
+                                  f"{robot_base_z:.4f}")
+                            if hasattr(self, 'policy'):
+                                self.policy.ROBOT_BASE[2] = robot_base_z
+                    except Exception:
+                        continue
+
                 # ── Query scanner & bin world positions ──
                 scanner_pos = None
                 bin_pos = None
@@ -419,24 +441,47 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 target_carton_name = None
                 try:
                     import json as _json
-                    import geniesim.utils.system_utils as _su
-                    problems_path = os.path.join(
-                        _su.benchmark_conf_path(), "llm_task",
+
+                    # Build candidate paths (BUG 8: fallback if
+                    # benchmark_conf_path() is stubbed)
+                    problems_paths = []
+                    try:
+                        import geniesim.utils.system_utils as _su
+                        problems_paths.append(os.path.join(
+                            _su.benchmark_conf_path(), "llm_task",
+                            self.args.sub_task_name, str(instance_id),
+                            "problems.json",
+                        ))
+                    except Exception:
+                        pass
+                    problems_paths.append(os.path.join(
+                        genie_sim_root, "source", "geniesim",
+                        "benchmark", "config", "llm_task",
                         self.args.sub_task_name, str(instance_id),
                         "problems.json",
-                    )
-                    if os.path.exists(problems_path):
-                        with open(problems_path) as f:
-                            problems = _json.load(f)
+                    ))
 
+                    problems_data = None
+                    for pp in problems_paths:
+                        if os.path.exists(pp):
+                            with open(pp) as f:
+                                problems_data = _json.load(f)
+                            print(f"[Patch] Loaded problems.json from {pp}")
+                            break
+
+                    if problems_data:
                         def _find_follow_target(obj):
+                            """Find Follow target in problems.json.
+
+                            Actual format:
+                              {"Follow": "carton_id|[bbox]|gripper"}
+                            The carton name is the first |-delimited field.
+                            """
                             if isinstance(obj, dict):
-                                if obj.get("class_name") == "Follow":
-                                    names = obj.get("params", {}).get(
-                                        "obj_name_list", []
-                                    )
-                                    if names:
-                                        return names[0]
+                                if "Follow" in obj:
+                                    val = obj["Follow"]
+                                    if isinstance(val, str):
+                                        return val.split("|")[0]
                                 for v in obj.values():
                                     r = _find_follow_target(v)
                                     if r:
@@ -448,10 +493,12 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                         return r
                             return None
 
-                        target_carton_name = _find_follow_target(problems)
+                        target_carton_name = _find_follow_target(
+                            problems_data
+                        )
                         if target_carton_name:
-                            print(f"[Patch] Target carton from problems.json: "
-                                  f"{target_carton_name}")
+                            print(f"[Patch] Target carton from "
+                                  f"problems.json: {target_carton_name}")
                 except Exception as e:
                     print(f"[Patch] WARNING: problems.json parse failed: {e}")
 
