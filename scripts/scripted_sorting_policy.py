@@ -41,7 +41,7 @@ class ScriptedSortingPolicy(BasePolicy):
     # ── Diagnostic mode ─────────────────────────────────────────────
     # When True: runs hold-position tests before normal operation.
     # Set to False once diagnostics confirm arm holds correctly.
-    DIAG_MODE = True
+    DIAG_MODE = False
     DIAG_HOLD_STEPS = 100    # hold INIT_RIGHT_ARM constant
     DIAG_ECHO_STEPS = 100    # echo observed joints back
     DIAG_WAIST_STEPS = 200   # rotate waist while holding arm

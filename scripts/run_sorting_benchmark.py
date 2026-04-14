@@ -333,6 +333,40 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 if hasattr(self.api_core, 'usd_objects'):
                     obj_names = list(self.api_core.usd_objects.keys())
                     print(f"[Patch] All USD objects ({len(obj_names)}): {obj_names[:10]}")
+
+                # ── Patch env.step to hold bj1-bj4 at initial values ──
+                # PiEnv.step() only commands bj5 (body_joint5). Without active
+                # position control, bj1-bj4 sag under gravity, tilting the
+                # upper body and making the arm appear to raise toward the head.
+                try:
+                    from geniesim.utils.name_utils import G2_WAIST_JOINT_NAMES
+                    _env = self.env
+                    _orig_step = _env.step
+
+                    # bj1-bj4 initial values from G2_STATES_4 body_state
+                    _body_hold = [1.57, 0.0, -0.31939525311, 1.34390352404]
+                    # Joint names: reversed list gives [idx01..idx05], take first 4
+                    _body_names = list(reversed(G2_WAIST_JOINT_NAMES))[0:4]
+                    _body_indices = [
+                        _env.robot_joint_indices[v] for v in _body_names
+                    ]
+
+                    def _patched_step(action):
+                        result = _orig_step(action)
+                        # Hold bj1-bj4 at initial values each step
+                        _env.api_core.set_joint_positions(
+                            [float(v) for v in _body_hold],
+                            joint_indices=_body_indices,
+                            is_trajectory=True,
+                        )
+                        return result
+
+                    _env.step = _patched_step
+                    print(f"[Patch] env.step wrapped: holding bj1-bj4 at "
+                          f"{_body_hold}, names={_body_names}, "
+                          f"indices={_body_indices}")
+                except Exception as e:
+                    print(f"[Patch] WARNING: failed to wrap env.step: {e}")
             else:
                 print("[Patch] WARNING: env is None after create_env!")
 

@@ -125,7 +125,31 @@ else
 fi
 
 echo ""
-echo "=== [3/3] Verifying setup ==="
+echo "=== [3/4] Patching config.yaml for sorting_packages ==="
+CONFIG_YAML="$GENIE_SIM_SRC/geniesim/config/config.yaml"
+if [ -f "$CONFIG_YAML" ]; then
+    # Add sub_task_name if missing
+    if ! grep -q "sub_task_name:" "$CONFIG_YAML"; then
+        # Insert after task_name line in benchmark section
+        sed -i '/^  task_name:/a\  sub_task_name: "sorting_packages"' "$CONFIG_YAML"
+        echo "  Added sub_task_name: sorting_packages"
+    else
+        echo "  sub_task_name already present"
+    fi
+
+    # Fix task_name if it's still the default gm_task_pickplace
+    if grep -q 'task_name:.*gm_task_pickplace' "$CONFIG_YAML"; then
+        sed -i 's/task_name:.*gm_task_pickplace.*/task_name: "warehouse_g2"/' "$CONFIG_YAML"
+        echo "  Fixed task_name: warehouse_g2"
+    else
+        echo "  task_name already correct"
+    fi
+else
+    echo "  WARNING: config.yaml not found at $CONFIG_YAML"
+fi
+
+echo ""
+echo "=== [4/4] Verifying setup ==="
 echo "Scripts dir: $SCRIPTS_DIR"
 ls -la "$SCRIPTS_DIR/run_sorting_benchmark.py" "$SCRIPTS_DIR/scripted_sorting_policy.py" 2>/dev/null
 
