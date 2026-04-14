@@ -507,8 +507,9 @@ class ScriptedSortingPolicy(BasePolicy):
     # ════════════════════════════════════════════════════════════════
 
     def _phase_approach(self, obs: dict) -> np.ndarray:
-        # Keep current bj5 — carton is already in front, no rotation needed
-        bj5_hold = obs["bj5"]
+        # Rotate bj5 toward table while approaching
+        bj5_target = self._bj5_table
+        new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
 
         # Move EEF above carton
         target_w = self._carton_pos.copy()
@@ -518,7 +519,7 @@ class ScriptedSortingPolicy(BasePolicy):
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
         )
-        action = self._build_action(obs["left_arm"], new_joints, bj5_hold)
+        action = self._build_action(obs["left_arm"], new_joints, new_bj5)
         self._log(obs, target_w, "above_carton")
 
         if dist < 0.04 or self.sub_step > 500:

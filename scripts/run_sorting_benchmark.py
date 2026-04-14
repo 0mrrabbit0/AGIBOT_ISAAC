@@ -373,6 +373,28 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                         self.policy.set_carton_positions(carton_positions)
                         print(f"[Patch] Passed {len(carton_positions)} carton positions to policy")
 
+                # ── Query robot base world z ──
+                robot_base_z = 0.0
+                try:
+                    for robot_path in [
+                        "/Workspace/Robot", "/World/Robot",
+                        "/Workspace/robot", "/World/robot",
+                    ]:
+                        try:
+                            rpos, _ = self.api_core.get_obj_world_pose(robot_path)
+                            robot_base_z = float(rpos[2])
+                            print(f"[Patch] Robot base z={robot_base_z:.4f} "
+                                  f"(from {robot_path})")
+                            break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print(f"[Patch] WARNING: robot base query failed: {e}")
+
+                if robot_base_z < 0.1:
+                    robot_base_z = 0.83  # estimated standing height
+                    print(f"[Patch] Robot base z fallback: {robot_base_z}")
+
                 # ── Query scanner & bin world positions ──
                 scanner_pos = None
                 bin_pos = None
@@ -393,26 +415,72 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 except Exception as e:
                     print(f"[Patch] WARNING: failed to query scanner/bin: {e}")
 
-                # Pass all scene positions to the policy
+                # ── Parse problems.json for target carton name ──
+                target_carton_name = None
+                try:
+                    import json as _json
+                    import geniesim.utils.system_utils as _su
+                    problems_path = os.path.join(
+                        _su.benchmark_conf_path(), "llm_task",
+                        self.args.sub_task_name, str(instance_id),
+                        "problems.json",
+                    )
+                    if os.path.exists(problems_path):
+                        with open(problems_path) as f:
+                            problems = _json.load(f)
+
+                        def _find_follow_target(obj):
+                            if isinstance(obj, dict):
+                                if obj.get("class_name") == "Follow":
+                                    names = obj.get("params", {}).get(
+                                        "obj_name_list", []
+                                    )
+                                    if names:
+                                        return names[0]
+                                for v in obj.values():
+                                    r = _find_follow_target(v)
+                                    if r:
+                                        return r
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    r = _find_follow_target(item)
+                                    if r:
+                                        return r
+                            return None
+
+                        target_carton_name = _find_follow_target(problems)
+                        if target_carton_name:
+                            print(f"[Patch] Target carton from problems.json: "
+                                  f"{target_carton_name}")
+                except Exception as e:
+                    print(f"[Patch] WARNING: problems.json parse failed: {e}")
+
+                # ── Select target carton position ──
+                target_carton_pos = None
+                if target_carton_name and target_carton_name in carton_positions:
+                    target_carton_pos = carton_positions[target_carton_name]
+                    print(f"[Patch] Matched target: {target_carton_name} "
+                          f"at {target_carton_pos}")
+                elif carton_positions:
+                    name, pos = next(iter(carton_positions.items()))
+                    target_carton_pos = pos
+                    print(f"[Patch] WARNING: fallback to {name}")
+
+                # ── Pass scene positions + robot z to policy ──
                 if hasattr(self, 'policy') and self.policy is not None:
-                    if hasattr(self.policy, 'set_scene_positions'):
-                        # Find the target carton (first one, or the one
-                        # matching 028/020 type)
-                        target_carton_pos = None
-                        for name, pos in carton_positions.items():
-                            if "028" in name or "020" in name:
-                                target_carton_pos = pos
-                                break
-                        if target_carton_pos is None and carton_positions:
-                            target_carton_pos = next(
-                                iter(carton_positions.values())
-                            )
-                        if target_carton_pos is not None:
-                            self.policy.set_scene_positions(
-                                carton_pos=target_carton_pos,
-                                scanner_pos=scanner_pos or [0.929, 0.0, 1.163],
-                                bin_pos=bin_pos or [0.300, -0.917, 0.837],
-                            )
+                    # Set robot base z
+                    if hasattr(self.policy, 'ROBOT_BASE'):
+                        self.policy.ROBOT_BASE[2] = robot_base_z
+                        print(f"[Patch] ROBOT_BASE updated: "
+                              f"{self.policy.ROBOT_BASE}")
+
+                    if (hasattr(self.policy, 'set_scene_positions')
+                            and target_carton_pos is not None):
+                        self.policy.set_scene_positions(
+                            carton_pos=target_carton_pos,
+                            scanner_pos=scanner_pos or [0.929, 0.0, 1.163],
+                            bin_pos=bin_pos or [0.300, -0.917, 0.837],
+                        )
 
                 # Log all USD objects
                 if hasattr(self.api_core, 'usd_objects'):
