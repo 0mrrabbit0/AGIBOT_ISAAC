@@ -57,15 +57,55 @@ import importlib.abc
 import importlib.machinery
 
 
-class _FallbackModule(types.ModuleType):
-    """A module that returns dummy objects for any attribute access."""
+class _StubMeta(type):
+    """Metaclass that makes stub classes behave as catch-all bases."""
+    def __getattr__(cls, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return _StubClass
+    def __instancecheck__(cls, instance):
+        return True
+    def __subclasscheck__(cls, subclass):
+        return True
+
+
+class _StubClass(metaclass=_StubMeta):
+    """A class that can be inherited from (e.g. `class SimNode(Node):`)."""
+    def __init__(self, *args, **kwargs):
+        pass
+    def __init_subclass__(cls, **kwargs):
+        pass
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
-        return _FallbackModule(f"{self.__name__}.{name}")
+        return _StubClass
+    def __call__(self, *args, **kwargs):
+        return _StubClass()
+    def __bool__(self):
+        return False
+    def __iter__(self):
+        return iter([])
+    def __str__(self):
+        return ""
+    def __int__(self):
+        return 0
+    def __float__(self):
+        return 0.0
+
+
+class _FallbackModule(types.ModuleType):
+    """A module that returns _StubClass for any attribute access.
+
+    _StubClass is both callable and inheritable, so code like
+    `class SimNode(Node):` works when Node comes from a mocked module.
+    """
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return _StubClass
 
     def __call__(self, *a, **kw):
-        return _FallbackModule(f"{self.__name__}()")
+        return _StubClass()
 
     def __iter__(self):
         return iter([])
@@ -82,6 +122,11 @@ class FallbackImporter(importlib.abc.MetaPathFinder):
     ALLOWED = {
         "open3d", "numba", "grasp_nms", "openai", "anthropic",
         "google", "dashscope", "zhipuai",
+        "rclpy", "rosgraph_msgs", "std_msgs", "sensor_msgs",
+        "geometry_msgs", "nav_msgs", "builtin_interfaces",
+        "rcl_interfaces", "action_msgs", "unique_identifier_msgs",
+        "rosidl_runtime_py", "tf2_msgs", "tf2_ros",
+        "cv_bridge", "toml", "curobo",
     }
 
     def find_module(self, fullname, path=None):
@@ -235,8 +280,7 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     print("[Check] No USD stage available")
                     return found
 
-                # Check both possible parent paths
-                for parent in ["/Workspace/World/Objects", "/World/Objects"]:
+                for parent in ["/Workspace/Objects", "/Workspace/World/Objects", "/World/Objects"]:
                     from pxr import Usd
                     parent_prim = stage.GetPrimAtPath(parent)
                     if parent_prim.IsValid():
@@ -379,33 +423,40 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 # PiEnv.step() only commands bj5 (body_joint5). Without active
                 # position control, bj1-bj4 sag under gravity, tilting the
                 # upper body and making the arm appear to raise toward the head.
+                # robot_joint_indices is set in reset(), so we wrap step()
+                # lazily — the first call resolves the indices.
                 try:
                     from geniesim.utils.name_utils import G2_WAIST_JOINT_NAMES
                     _env = self.env
                     _orig_step = _env.step
 
-                    # bj1-bj4 initial values from G2_STATES_4 body_state
-                    _body_hold = [1.57, 0.0, -0.31939525311, 1.34390352404]
-                    # Joint names: reversed list gives [idx01..idx05], take first 4
+                    # body_state is [bj5,bj4,bj3,bj2,bj1] order; we need [bj1,bj2,bj3,bj4]
+                    _bs = _G2_STATES_4["body_state"]
+                    _body_hold = [_bs[4], _bs[3], _bs[2], _bs[1]]
                     _body_names = list(reversed(G2_WAIST_JOINT_NAMES))[0:4]
-                    _body_indices = [
-                        _env.robot_joint_indices[v] for v in _body_names
-                    ]
+                    _body_indices_cache = []
 
                     def _patched_step(action):
                         result = _orig_step(action)
-                        # Hold bj1-bj4 at initial values each step
-                        _env.api_core.set_joint_positions(
-                            [float(v) for v in _body_hold],
-                            joint_indices=_body_indices,
-                            is_trajectory=True,
-                        )
+                        if not _body_indices_cache:
+                            if hasattr(_env, 'robot_joint_indices'):
+                                _body_indices_cache.extend(
+                                    _env.robot_joint_indices[v]
+                                    for v in _body_names
+                                )
+                                print(f"[Patch] bj1-bj4 hold active: "
+                                      f"indices={_body_indices_cache}")
+                        if _body_indices_cache:
+                            _env.api_core.set_joint_positions(
+                                [float(v) for v in _body_hold],
+                                joint_indices=_body_indices_cache,
+                                is_trajectory=True,
+                            )
                         return result
 
                     _env.step = _patched_step
-                    print(f"[Patch] env.step wrapped: holding bj1-bj4 at "
-                          f"{_body_hold}, names={_body_names}, "
-                          f"indices={_body_indices}")
+                    print(f"[Patch] env.step wrapped (lazy): "
+                          f"will hold bj1-bj4 at {_body_hold}")
                 except Exception as e:
                     print(f"[Patch] WARNING: failed to wrap env.step: {e}")
             else:
@@ -441,19 +492,14 @@ os.chdir(app_dir)
 # robot_cfg/ — point it at app.py so the path resolves correctly.
 sys.modules["__main__"].__file__ = app_py
 
-# Execute app.py in the current process
-# Patch the source to force-disable ROS (rclpy) even if config defaults
-# have enable_ros=true. The CLI args --app.enable_ros false may not
-# override correctly depending on the config parser version.
-import re
+# Execute app.py in the current process.
+# Patch out rclpy hard dependency — called unconditionally at module level.
 app_source = open(app_py).read()
-# Replace the ROS conditional block: force rclpy = None
-app_source = re.sub(
-    r'if\s+cfg\.app\.enable_ros\s+or\s+cfg\.benchmark\.enable_ros\s*:.*?'
-    r'(?=\nelse:)',
-    'if False:  # PATCHED: ROS disabled\n    pass',
-    app_source,
-    flags=re.DOTALL,
+app_source = app_source.replace(
+    "rclpy = wait_rclpy()", "rclpy = None  # PATCHED: skip wait_rclpy"
 )
-print("[Run] Patched app.py source to disable ROS/rclpy")
+app_source = app_source.replace(
+    "rclpy.init()", "pass  # PATCHED: skip rclpy.init()"
+)
+print("[Run] Patched app.py source to disable rclpy")
 exec(compile(app_source, app_py, "exec"))
