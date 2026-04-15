@@ -528,9 +528,14 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     _body_hold = [_bs[4], _bs[3], _bs[2], _bs[1]]
                     _body_names = list(reversed(G2_WAIST_JOINT_NAMES))[0:4]
                     _body_indices_cache = []
+                    _step_counter = [0]
+                    _diag_carton_name = target_carton_name
 
                     def _patched_step(action):
                         result = _orig_step(action)
+                        _step_counter[0] += 1
+
+                        # Hold bj1-bj4
                         if not _body_indices_cache:
                             if hasattr(_env, 'robot_joint_indices'):
                                 _body_indices_cache.extend(
@@ -545,6 +550,42 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                 joint_indices=_body_indices_cache,
                                 is_trajectory=True,
                             )
+
+                        # Diagnostic: real gripper world position
+                        if _step_counter[0] % 30 == 1:
+                            try:
+                                rp, _ = _env.api_core.get_obj_world_pose(
+                                    "/genie/gripper_r_center_link"
+                                )
+                                msg = (f"[Diag] step={_step_counter[0]} "
+                                       f"real_grip=[{rp[0]:.4f},"
+                                       f"{rp[1]:.4f},{rp[2]:.4f}]")
+                                if _diag_carton_name:
+                                    for par in ["/Workspace/Objects"]:
+                                        try:
+                                            cp, _ = (
+                                                _env.api_core
+                                                .get_obj_world_pose(
+                                                    f"{par}/{_diag_carton_name}"
+                                                )
+                                            )
+                                            import math
+                                            d = math.sqrt(sum(
+                                                (float(rp[i]) - float(cp[i])) ** 2
+                                                for i in range(3)
+                                            ))
+                                            msg += (f" carton=[{cp[0]:.3f},"
+                                                    f"{cp[1]:.3f},{cp[2]:.3f}]"
+                                                    f" dist={d:.4f}")
+                                            break
+                                        except Exception:
+                                            continue
+                                print(msg)
+                            except Exception as e:
+                                if _step_counter[0] <= 2:
+                                    print(f"[Diag] gripper query "
+                                          f"failed: {e}")
+
                         return result
 
                     _env.step = _patched_step
