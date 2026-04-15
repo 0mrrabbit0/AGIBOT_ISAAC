@@ -108,6 +108,7 @@ class ScriptedSortingPolicy(BasePolicy):
         self._bj5_bin = None
 
         self._init_eef_rpy = None
+        self._shared_state = None  # set by benchmark runner
         self.reset()
 
     # ── Runtime configuration ────────────────────────────────────────
@@ -190,6 +191,30 @@ class ScriptedSortingPolicy(BasePolicy):
     def arm_base_to_world(self, local_pos: np.ndarray, body_joints: np.ndarray) -> np.ndarray:
         T = self._world_to_arm_T(body_joints)
         return (T @ np.append(local_pos, 1.0))[:3]
+
+    # ── Closed-loop FK correction ────────────────────────────────────
+
+    def _get_fk_correction(self, obs: dict) -> np.ndarray:
+        """Correction vector: real_gripper_world - fk_gripper_world.
+
+        Compensates body_fk / ROBOT_BASE errors so IK targets are accurate.
+        """
+        if self._shared_state is None:
+            return np.zeros(3)
+        real_grip = self._shared_state.get("real_gripper_world")
+        if real_grip is None:
+            return np.zeros(3)
+        real_grip = np.array(real_grip)
+        fk_grip = self.arm_base_to_world(obs["r_eef_pos"], obs["body"])
+        return real_grip - fk_grip
+
+    def _corrected_world_to_arm(
+        self, world_pos: np.ndarray, obs: dict,
+    ) -> np.ndarray:
+        """world → arm_base_link with FK correction applied."""
+        correction = self._get_fk_correction(obs)
+        adjusted = world_pos - correction
+        return self.world_to_arm_base(adjusted, obs["body"])
 
     # ── bj5 computation ──────────────────────────────────────────────
 
@@ -371,13 +396,25 @@ class ScriptedSortingPolicy(BasePolicy):
     def _log(self, obs: dict, target_world: np.ndarray | None = None, label: str = "") -> None:
         if self.step_count % 30 != 0:
             return
-        eef_w = self.arm_base_to_world(obs["r_eef_pos"], obs["body"])
-        msg = (f"[s={self.step_count}] {self.phase}:{self.sub_step} "
-               f"eef_w=[{eef_w[0]:.3f},{eef_w[1]:.3f},{eef_w[2]:.3f}]")
+        correction = self._get_fk_correction(obs)
+        real_grip = (
+            self._shared_state.get("real_gripper_world")
+            if self._shared_state else None
+        )
+        if real_grip is not None:
+            rg = np.array(real_grip)
+            msg = (f"[s={self.step_count}] {self.phase}:{self.sub_step} "
+                   f"eef_real=[{rg[0]:.3f},{rg[1]:.3f},{rg[2]:.3f}]"
+                   f" corr=[{correction[0]:.3f},{correction[1]:.3f},{correction[2]:.3f}]")
+        else:
+            eef_w = self.arm_base_to_world(obs["r_eef_pos"], obs["body"])
+            msg = (f"[s={self.step_count}] {self.phase}:{self.sub_step} "
+                   f"eef_w=[{eef_w[0]:.3f},{eef_w[1]:.3f},{eef_w[2]:.3f}]")
         if target_world is not None:
-            tgt_l = self.world_to_arm_base(target_world, obs["body"])
+            tgt_l = self._corrected_world_to_arm(target_world, obs)
             d = np.linalg.norm(tgt_l - obs["r_eef_pos"])
-            msg += f" tgt=[{target_world[0]:.3f},{target_world[1]:.3f},{target_world[2]:.3f}] d={d:.3f}"
+            msg += (f" tgt=[{target_world[0]:.3f},{target_world[1]:.3f},"
+                    f"{target_world[2]:.3f}] d={d:.3f}")
         if label:
             msg += f" [{label}]"
         print(msg)
@@ -413,6 +450,12 @@ class ScriptedSortingPolicy(BasePolicy):
             print(f"  body_fk arm_base (INIT): {init_arm_base}")
             obs_arm_base = self.body_fk(obs["body"])[:3, 3] + self.ROBOT_BASE
             print(f"  body_fk arm_base (obs):  {obs_arm_base}")
+        # Show FK correction if available
+        correction = self._get_fk_correction(obs)
+        if np.linalg.norm(correction) > 0.01:
+            print(f"  FK correction: [{correction[0]:.4f}, "
+                  f"{correction[1]:.4f}, {correction[2]:.4f}]")
+            print(f"  ||correction||: {np.linalg.norm(correction):.4f}m")
         print("=" * 60)
 
     # ── Detect target carton from instruction ────────────────────────
@@ -514,7 +557,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Move EEF above carton
         target_w = self._carton_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
-        target_l = self.world_to_arm_base(target_w, obs["body"])
+        target_l = self._corrected_world_to_arm(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -538,7 +581,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.right_grip < 0.5:
             target_w = self._carton_pos.copy()
             target_w[2] += self.GRASP_HEIGHT
-            target_l = self.world_to_arm_base(target_w, obs["body"])
+            target_l = self._corrected_world_to_arm(target_w, obs)
             new_joints, dist = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -562,7 +605,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 3: lift carton
         target_w = self._carton_pos.copy()
         target_w[2] += self.LIFT_HEIGHT
-        target_l = self.world_to_arm_base(target_w, obs["body"])
+        target_l = self._corrected_world_to_arm(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -594,7 +637,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 2: move above scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
-        target_l = self.world_to_arm_base(target_w, obs["body"])
+        target_l = self._corrected_world_to_arm(target_w, obs)
         new_joints, dist_above = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -610,7 +653,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 3: lower onto scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.GRASP_HEIGHT
-        target_l = self.world_to_arm_base(target_w, obs["body"])
+        target_l = self._corrected_world_to_arm(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -644,7 +687,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.sub_step <= 80:
             target_w = self._scanner_pos.copy()
             target_w[2] += self.APPROACH_HEIGHT
-            target_l = self.world_to_arm_base(target_w, obs["body"])
+            target_l = self._corrected_world_to_arm(target_w, obs)
             new_joints, _ = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -661,7 +704,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.right_grip < 0.5:
             target_w = self._scanner_pos.copy()
             target_w[2] += self.GRASP_HEIGHT
-            target_l = self.world_to_arm_base(target_w, obs["body"])
+            target_l = self._corrected_world_to_arm(target_w, obs)
             new_joints, dist = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -684,7 +727,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 5: lift from scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.LIFT_HEIGHT
-        target_l = self.world_to_arm_base(target_w, obs["body"])
+        target_l = self._corrected_world_to_arm(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -714,12 +757,13 @@ class ScriptedSortingPolicy(BasePolicy):
             return action
 
         # Sub 2: extend arm toward bin (may not fully reach, that's OK)
-        arm_w = self.arm_base_to_world(np.zeros(3), obs["body"])
-        to_bin = self._bin_pos - arm_w
+        correction = self._get_fk_correction(obs)
+        arm_w_real = self.arm_base_to_world(np.zeros(3), obs["body"]) + correction
+        to_bin = self._bin_pos - arm_w_real
         to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
-        reach_w = arm_w + to_bin_dir * 0.65
+        reach_w = arm_w_real + to_bin_dir * 0.65
         reach_w[2] = max(self._bin_pos[2] + 0.15, reach_w[2])
-        target_l = self.world_to_arm_base(reach_w, obs["body"])
+        target_l = self._corrected_world_to_arm(reach_w, obs)
 
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
