@@ -1,4 +1,4 @@
-# Code Review & Modification Suggestions (Round 4)
+# Code Review & Modification Suggestions (Round 5)
 
 **日期**: 2026-04-15
 **审查者**: 本地 Claude Code (评估端)
@@ -8,98 +8,146 @@
 
 ## 上一轮修改评估
 
-Commit `c3c894f`:
-- problems.json 解析格式修复 ✓ — `{"Follow": "carton_id|bbox|gripper"}` 格式正确解析
-- 路径 fallback ✓ — 成功从 hardcoded 路径加载 problems.json
-- 目标 carton 正确选中 ✓ — `benchmark_carton_00364e8c` at [0.302, 0.700, 0.779]
-- Robot link probe ✗ — **base_link z=0.0 覆盖了 0.83 fallback，导致 ROBOT_BASE z 又变回 0**
+Commit `9c2af8d`: 删除了 probe 块。但运行时 probe 仍然覆盖了 z（因为 probe 代码在 robot_base_z fallback 之后执行，找到 base_link z=0 后覆盖了 0.83）。
+
+**BUG 10 已修复** ✓ — probe 块已删除
 
 ---
 
 ## 本轮运行结果：全部 0 分
 
+但有巨大进步：
 ```
-Follow: 0.0 | PickUpOnGripper: 0.0 | Inside: 0.0 | Upright: 0.0 | PickUpOnGripper: 0.0 | Inside: 0.0
+APPROACH: d=0.275 → d<0.04 in 52 steps! (之前要 500 步且不收敛)
+GRASP: 成功进入，夹爪关闭 ✓
+MOVE_TO_SCANNER: 转腰+移动到扫码台 ✓
 ```
 
-**好消息**: 目标 carton 修对后，APPROACH d 从 1.027 降到 0.223（比上轮 0.336 好很多）
-**坏消息**: Probe 代码找到 base_link z=0.0 后覆盖了 0.83 fallback → ROBOT_BASE z=0 → body FK 世界坐标又错了
+然而 Follow 评分 = 0。StepOut 在 600 步超时后触发，Follow 被取消。
 
 ---
 
-## BUG 10 [致命]: Probe 覆盖了正确的 z fallback
+## 关键发现：Follow 评测器使用 `/genie/` prim 路径
 
-**文件**: `scripts/run_sorting_benchmark.py` — probe 代码块
+**来源**: 容器内 `/workspace/genie_sim/source/geniesim/plugins/ader/action/custom/follow.py`
 
-**问题**: 代码在 robot_base_z=0.83 (fallback) 之后执行 probe，找到 `/Workspace/Robot/base_link` z=0.0，然后用 0.0 覆盖了 0.83。
-
-**日志证据**:
-```
-[Patch] Robot base z fallback: 0.83          ← 正确
-[Probe] /Workspace/Robot/base_link: z=0.0000 ← USD prim 本身在原点
-[Probe] Using base_link z=0.0000             ← 覆盖了正确值！
-[Patch] ROBOT_BASE updated: [0.24469 0.09325 0.     ]  ← z 又变回 0
-```
-
-**原因**: Isaac Sim 中 `/Workspace/Robot/base_link` 的 prim 位置是 0.0（USD 层级中的本地坐标），不代表仿真中的实际世界位置。所有 robot link prim 都报告 z=0.0。
-
-**修复**: probe 代码应该只在 z > 0.1 时才覆盖 fallback。把 probe 块中的覆盖逻辑改为：
-
+Follow 评测器获取夹爪真实世界位置的方式:
 ```python
-for probe_path in [
-    "/Workspace/Robot/base_link",
-    "/Workspace/Robot/right_arm_link7",
-    "/Workspace/Robot/idx67_arm_r_link7",
-]:
-    try:
-        pos, _ = self.api_core.get_obj_world_pose(probe_path)
-        print(f"[Probe] {probe_path}: z={float(pos[2]):.4f}")
-        # Only use if z is meaningful (robot is standing, not at origin)
-        if "base_link" in probe_path and float(pos[2]) > 0.1:
-            robot_base_z = float(pos[2])
-            print(f"[Probe] Using base_link z={robot_base_z:.4f}")
-    except Exception:
-        continue
+link_prim_path = "/genie/gripper_r_center_link"  # 不是 /Workspace/Robot/
+g_pos, _ = self.get_world_pose(link_prim_path)  # = api_core.get_obj_world_pose()
 ```
 
-并且把 `self.policy.ROBOT_BASE[2] = robot_base_z` 移到 probe 循环之后、与其他 policy 设置一起做（而不是在 probe 循环内部做，那会绕过后面的 `ROBOT_BASE updated` 逻辑）。
-
-**最简修复**: 直接删除整个 probe 代码块。0.83 作为 fallback 已经接近正确。probe 在当前 Isaac Sim 环境下无法获取有用信息。删掉后代码更简洁可靠：
-
+Follow 判定逻辑:
 ```python
-# 删除 for probe_path in [...] 整个块
-# 保留 robot_base_z = 0.83 fallback
+# bbox = [0.2, 0.2, 0.2] → 以包裹中心为原点 ±0.1m 的 AABB
+aa, bb = self.get_obj_aabb(obj_name, self.bbox)  # 取包裹世界位姿旋转后的 AABB
+return self.aabb_contains_point(gripper_pos, (aa, bb))  # 夹爪在 AABB 内？
 ```
+
+**所以 Follow 失败意味着: 仿真中 `/genie/gripper_r_center_link` 的真实世界位置不在包裹 ±0.1m 范围内**
 
 ---
 
-## 验证: z=0.83 让手臂能到达目标
+## BUG 11 [致命]: z=0.83 偏移量不正确，导致真实夹爪位置偏离目标
 
-上轮运行 (ROBOT_BASE z=0.83):
-- arm_base z=1.06, EEF z=0.90
-- 目标 carton z=0.78 + 0.15 = 0.93
-- 这些高度都在合理范围，手臂应该能到达
+**文件**: `scripts/run_sorting_benchmark.py` (z=0.83 fallback) + `scripts/scripted_sorting_policy.py` (body FK)
 
-本轮运行 (ROBOT_BASE z=0.0，因 probe bug):
-- arm_base z=0.23, EEF z=0.07
-- 目标 carton z=0.78 + 0.15 = 0.93
-- z 差距太大 → IK 无法收敛，d 停在 0.223
+**问题**: 我们的 body FK 用 ROBOT_BASE z=0.83 计算世界坐标。如果这个值不准确，`world_to_arm_base()` 给 IK 的目标位置就是错的，IK 解算出的关节角度使真实夹爪到达错误位置。
 
-**预期**: 修复后（z=0.83 + 正确目标 carton），arm 应该能到达 d<0.04
+**诊断方案**: 在 `_patched_step` 或 `_create_env_pi` 中添加代码，查询夹爪的**真实世界位置**并与 FK 输出对比：
+
+在 `run_sorting_benchmark.py` 的 `_patched_step` 中添加诊断（每 30 步打印一次）:
+
+```python
+_step_counter = [0]
+
+def _patched_step(action):
+    result = _orig_step(action)
+    _step_counter[0] += 1
+    
+    # Hold bj1-bj4 (existing code)
+    if not _body_indices_cache:
+        if hasattr(_env, 'robot_joint_indices'):
+            _body_indices_cache.extend(
+                _env.robot_joint_indices[v] for v in _body_names
+            )
+            print(f"[Patch] bj1-bj4 hold active: indices={_body_indices_cache}")
+    if _body_indices_cache:
+        _env.api_core.set_joint_positions(
+            [float(v) for v in _body_hold],
+            joint_indices=_body_indices_cache,
+            is_trajectory=True,
+        )
+    
+    # Diagnostic: query real gripper world position
+    if _step_counter[0] % 30 == 1:
+        try:
+            real_pos, _ = _env.api_core.get_obj_world_pose(
+                "/genie/gripper_r_center_link"
+            )
+            print(f"[Diag] step={_step_counter[0]} "
+                  f"real_gripper=[{real_pos[0]:.4f},{real_pos[1]:.4f},{real_pos[2]:.4f}]")
+        except Exception as e:
+            print(f"[Diag] gripper query failed: {e}")
+    
+    return result
+```
+
+**这是唯一确定 z 偏移是否正确的方法。** 对比 `real_gripper` 和 policy 打印的 `eef_w` 值：
+- 如果 z 差距 ≈ 0 → z=0.83 正确，问题在别处
+- 如果 z 差距 ≈ X → ROBOT_BASE z 应调整为 0.83 - X
+- 如果完全查不到 `/genie/gripper_r_center_link` → 需要换其他路径
+
+**额外**: 可以同时打印包裹与夹爪的距离来验证 Follow 判定:
+
+```python
+    # Also print distance to target carton
+    if _step_counter[0] % 30 == 1:
+        try:
+            real_pos, _ = _env.api_core.get_obj_world_pose(
+                "/genie/gripper_r_center_link"
+            )
+            # target carton name stored earlier
+            if target_carton_name:
+                carton_prim = None
+                for parent in ["/Workspace/Objects"]:
+                    cp = f"{parent}/{target_carton_name}"
+                    try:
+                        c_pos, _ = _env.api_core.get_obj_world_pose(cp)
+                        carton_prim = cp
+                        break
+                    except:
+                        continue
+                if carton_prim:
+                    dist = np.sqrt(sum((float(real_pos[i])-float(c_pos[i]))**2 
+                                       for i in range(3)))
+                    print(f"[Diag] real_grip-carton dist={dist:.4f} "
+                          f"carton=[{c_pos[0]:.3f},{c_pos[1]:.3f},{c_pos[2]:.3f}]")
+        except Exception as e:
+            print(f"[Diag] query failed: {e}")
+```
 
 ---
 
 ## 修改优先级
 
-1. **BUG 10** (probe 覆盖 z) — **唯一需要修复的问题**，删掉 probe 块或加 > 0.1 检查
+1. **诊断代码** (BUG 11) — 添加到 `_patched_step`，查询 `/genie/gripper_r_center_link` 真实世界位置
+2. 不要改其他东西 — 先确定 z 偏移问题的准确大小
+
+---
+
+## 重要：机器人 prim 根路径是 `/genie/`
+
+之前我们以为是 `/Workspace/Robot/`，但 Follow 评测器用的是 `/genie/`。所有机器人 link 查询应使用 `/genie/` 前缀：
+- `/genie/base_link`
+- `/genie/gripper_r_center_link`
+- `/genie/gripper_l_center_link`
 
 ---
 
 ## 下次运行检查清单
 
-- [ ] `ROBOT_BASE updated: [0.244, 0.093, 0.83]` （z=0.83，不是 0.0）
-- [ ] `arm_base (INIT): z ≈ 1.06` （肩膀高度）
-- [ ] `EEF world: z ≈ 0.90` （初始夹爪高度）
-- [ ] APPROACH d 快速下降到 <0.04
-- [ ] Follow score > 0
-- [ ] 进入 GRASP 阶段后关闭夹爪
+- [ ] `[Diag] step=1 real_gripper=[x,y,z]` 出现（确认查询成功）
+- [ ] 对比 `real_gripper` z 值与 `eef_w` z 值的差距
+- [ ] 对比 `real_grip-carton dist` 与 `d=` 的差距
+- [ ] 如果 z 差距明显（>0.05m），根据差值调整 ROBOT_BASE z
