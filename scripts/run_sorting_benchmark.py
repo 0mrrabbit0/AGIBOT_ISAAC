@@ -395,28 +395,6 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     robot_base_z = 0.83  # estimated standing height
                     print(f"[Patch] Robot base z fallback: {robot_base_z}")
 
-                # ── BUG 9 probe: query known robot links ──
-                for probe_path in [
-                    "/Workspace/Robot/base_link",
-                    "/Workspace/Robot/right_arm_link7",
-                    "/Workspace/Robot/idx67_arm_r_link7",
-                ]:
-                    try:
-                        pos, _ = self.api_core.get_obj_world_pose(
-                            probe_path
-                        )
-                        print(f"[Probe] {probe_path}: "
-                              f"z={float(pos[2]):.4f}")
-                        # If base_link found, use its z directly
-                        if "base_link" in probe_path:
-                            robot_base_z = float(pos[2])
-                            print(f"[Probe] Using base_link z="
-                                  f"{robot_base_z:.4f}")
-                            if hasattr(self, 'policy'):
-                                self.policy.ROBOT_BASE[2] = robot_base_z
-                    except Exception:
-                        continue
-
                 # ── Query scanner & bin world positions ──
                 scanner_pos = None
                 bin_pos = None
