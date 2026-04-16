@@ -73,10 +73,10 @@ class ScriptedSortingPolicy(BasePolicy):
     # ── Motion parameters ────────────────────────────────────────────
     BJ5_SPEED = 0.04          # rad/step for waist rotation
     EEF_STEP_FAST = 0.018     # m/step for fast moves
-    EEF_STEP_SLOW = 0.008     # m/step for precise moves
-    APPROACH_HEIGHT = 0.15    # m above target for pre-approach
-    GRASP_HEIGHT = 0.02       # m above target for grasping
-    LIFT_HEIGHT = 0.22        # m above target after grasping
+    EEF_STEP_SLOW = 0.012     # m/step for precise moves
+    APPROACH_HEIGHT = 0.06    # m above target for pre-approach
+    GRASP_HEIGHT = -0.02      # m relative to carton center (below center)
+    LIFT_HEIGHT = 0.30        # m above target after grasping
     GRASP_HOLD_STEPS = 35     # steps to hold gripper closed
     RELEASE_HOLD_STEPS = 30   # steps to hold gripper open
 
@@ -300,7 +300,7 @@ class ScriptedSortingPolicy(BasePolicy):
         target_pos: np.ndarray,
         target_rpy: np.ndarray,
         current_arm_14: np.ndarray,
-        n_iter: int = 10,
+        n_iter: int = 15,
     ) -> np.ndarray | None:
         """Solve IK for right arm. Returns 14-element joint array or None."""
         if self.ikfk_solver is None:
@@ -628,7 +628,7 @@ class ScriptedSortingPolicy(BasePolicy):
 
         # If gripper is already close (within Follow AABB ~0.2m),
         # hold position — don't risk moving away with broken FK
-        if world_dist < 0.10:
+        if world_dist < 0.06:
             bj5_target = self._bj5_table
             new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
             action = self._build_action(
@@ -688,7 +688,7 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, target_w, "lowering")
 
             # Close gripper when real distance is small enough
-            if real_dist < 0.05 or dist < 0.02 or self.sub_step > 400:
+            if real_dist < 0.035 or dist < 0.015 or self.sub_step > 500:
                 self.right_grip = 1.0
                 self.sub_step = 0  # reset for hold counting
                 print(f"[Policy] Gripper closing at step {self.step_count}"
