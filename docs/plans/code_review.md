@@ -1,4 +1,4 @@
-# Code Review & Modification Suggestions (Round 9)
+# Code Review & Modification Suggestions (Round 10)
 
 **Date**: 2026-04-16
 **Reviewer**: Local Claude Code (Evaluation)
@@ -6,86 +6,67 @@
 
 ---
 
-## Round 8 Result: FOLLOW = 1.0 for yellow carton! Average = 0.0833
+## Round 9 Result: Follow = 1.0 for ALL 8 episodes! Average = 0.1667
 
 ### Scores (8 episodes)
 
 | Episode | Carton | Follow | PickUp | Inside | Upright | PickUp2 | Inside2 |
 |---------|--------|--------|--------|--------|---------|---------|---------|
 | 1–4     | Yellow | **1.0** | 0 | 0 | 0 | 0 | 0 |
-| 5–8     | Black  | 0      | 0 | 0 | 0 | 0 | 0 |
+| 5–8     | Black  | **1.0** | 0 | 0 | 0 | 0 | 0 |
 
-**Average: 0.0833** (4 Follow successes × 1 point / 48 total)
+**Average: 0.1667** (8 Follow successes / 48 total points)
 
 ### What Works Now
 
-1. **Real-time carton position tracking**: `[Policy] Carton pos updated: [0.328,0.687,1.074] → [0.302,0.700,0.779] (diff=0.296m)` — BUG 13 FIXED!
-2. **Follow = 1.0 for all 4 yellow carton episodes!** Gripper enters AABB at step 180 (z=0.860)
-3. **Arm converges initially**: d_world 0.480 → 0.234 → 0.115 → 0.105 in APPROACH
-4. **bj5 computation correct**: yellow=1.431, black=1.199
+1. **Frame mismatch fix works!** `_world_target_to_solver_frame` eliminated the systematic 0.11m x-error
+2. **Yellow carton**: APPROACH converges to d=0.085 in 60 steps (was 0.105 in R8)
+3. **Yellow carton**: GRASP converges to d=0.055 in 47 steps (was 0.119 in R8)
+4. **Yellow carton**: Gripper closes at real_dist=0.049 (was 0.126 timeout in R8)
+5. **Black carton**: Follow now triggers! Arm reaches [0.473, 0.692, 0.869] — inside AABB
+6. **Black carton**: d_world reduced from 0.114 (R8, completely frozen) to 0.096 (R9)
 
 ---
 
-## BUG 15 [CRITICAL]: Coordinate Frame Mismatch — arm stalls at ~0.12m from target
+## BUG 18 [CRITICAL]: Gripper closes too high — carton lifts 0.004m then drops
 
 ### Evidence
 
-Yellow carton GRASP trajectory (carton at [0.302, 0.700, 0.779]):
+Yellow carton GRASP sequence:
 ```
-Step 150: eef=[0.201, 0.760, 0.905]  d=0.159  ← converging
-Step 180: eef=[0.198, 0.752, 0.860]  d=0.131  ← Follow triggers here!
-Step 210: eef=[0.196, 0.746, 0.836]  d=0.121  
-Step 240: eef=[0.195, 0.744, 0.827]  d=0.119  ← stalling
-Step 270: eef=[0.195, 0.744, 0.825]  d=0.119  ← STUCK
-Step 420: eef=[0.193, 0.745, 0.825]  d=0.121  ← STILL STUCK
-Step 432: Gripper closes at real_dist=0.126 (sub_step > 300 timeout)
+Step 150 (GRASP:47): eef=[0.302, 0.682, 0.851] d=0.055  ← Follow triggers
+Step 166 (GRASP:63): Gripper closes at real_dist=0.049
+Step 181 (after close): carton z = 0.783 (was 0.779, lifted 0.004m!)
+Step 211 (lifting):     carton z = 0.779 (dropped back — LOST GRIP)
 ```
 
-Stall point [0.193, 0.745, 0.825] vs target [0.302, 0.700, 0.799]:
-- **x error: 0.109m** (systematic, same for black carton: 0.504-0.393=0.111m)
-- y error: 0.045m
-- z error: 0.026m
+The gripper at z=0.851 is at the very TOP of the carton (carton center z=0.779, carton half-height ~0.075m, top ≈ 0.854). The fingers barely catch the edge, lift 0.004m, then the carton slips out.
 
-Black carton APPROACH trajectory (carton at [0.504, 0.757, 0.779]):
+**PickUpOnGripper requires lift > 0.02m** — we achieve only 0.004m.
+
+### Root Cause: Arm can't descend from z=0.851 to z=0.799 (target)
+
+The GRASP descent rate:
 ```
-Step  60: eef=[0.553, 0.568, 1.150]  d=0.295  ← moving correctly
-Step  90: eef=[0.493, 0.658, 1.071]  d=0.173  ← moving, x passed target
-Step 120: eef=[0.441, 0.727, 1.003]  d=0.102  ← x overshoots (0.441 < 0.504)
-Step 150: eef=[0.409, 0.755, 0.969]  d=0.103  ← DIVERGING
-Step 210: eef=[0.394, 0.761, 0.959]  d=0.114  ← STUCK
-Step 240+: eef=[0.393, 0.761, 0.959]  d=0.114  ← FROZEN for 300 steps
+GRASP:17 → z=0.911  (start)
+GRASP:47 → z=0.851  (0.060m in 30 steps = 0.002m/step)
+GRASP:63 → z≈0.841  (0.010m in 16 steps = 0.0006m/step ← decelerating)
 ```
 
-### Root Cause: `target_local` and `obs["r_eef_pos"]` are in different frames
+The arm is decelerating as it approaches a joint configuration limit. At z=0.851, the gripper close threshold (real_dist < 0.05) triggers, closing the gripper prematurely while still 0.072m above the carton center.
 
-The function `_move_right_toward(target_l, obs["r_eef_pos"], ...)` computes:
-```python
-error = target_l - obs["r_eef_pos"]
-```
+---
 
-But these are in **different coordinate frames**:
-- `target_l` = `_corrected_world_to_arm(target_w, obs)` transforms through **real arm_base prim** (at [0.137, 0.093, 1.145])
-- `obs["r_eef_pos"]` = IKFKSolver FK output, relative to **body FK arm_base** (at [0.565, 0.233, 1.060])
+## BUG 19: Black carton at workspace boundary (d=0.096, arm stalls)
 
-The body FK arm_base is **0.428m off in x, 0.140m off in y** from the real prim position. When these positions are subtracted, the resulting error vector doesn't represent the true displacement needed.
+The black carton at [0.504, 0.757, 0.779] is 0.759m from arm_base [0.137, 0.093, 1.145] in the x-y plane — near the arm's workspace limit (~0.75-0.8m reach).
 
-The arm initially moves in the right direction (because the error direction is approximately correct at large distances), but converges to the wrong position (because the absolute frame offset dominates at small distances). The ~0.11m systematic x-axis error is a direct consequence of this frame mismatch.
+The arm stalls at [0.467, 0.681, 0.845]:
+- x: 0.037m short
+- y: 0.076m short
+- z: 0.046m high
 
-### Fix: Use relative error transform (rotation only)
-
-Instead of transforming the absolute world target through T_inv (which produces coordinates in the real arm_base frame, incompatible with `obs["r_eef_pos"]`), compute the world-frame displacement from the real gripper to the target, rotate it to the arm_base local frame, and add it to `obs["r_eef_pos"]`:
-
-```python
-world_error = target_world - real_gripper_world     # vector in world frame
-local_error = R_arm_base_inv @ world_error           # rotate to local frame
-target_solver = obs["r_eef_pos"] + local_error       # target in solver's frame
-```
-
-This works because:
-- `obs["r_eef_pos"]` is the current EEF in the solver's arm_base frame ✓
-- `local_error` is the world displacement rotated to match the local frame orientation ✓
-- The rotation from the real arm_base prim IS correct (same physical frame) ✓
-- Only the position was wrong (body FK error), and we avoid using it ✓
+The gripper never closes (real_dist=0.107, sub_step only reaches 389 before StepOut at step 720).
 
 ---
 
@@ -93,148 +74,121 @@ This works because:
 
 ### File: `scripts/scripted_sorting_policy.py`
 
-#### Change 1: New method `_world_target_to_solver_frame()`
+#### Change 1: Lower APPROACH_HEIGHT from 0.15 to 0.06
 
-Add this method right after `_corrected_arm_to_world` (around line 248):
-
-```python
-def _world_target_to_solver_frame(
-    self, target_world: np.ndarray, obs: dict,
-) -> np.ndarray:
-    """Convert world target to IKFKSolver's local frame.
-
-    Uses relative error: computes world displacement from real gripper
-    to target, rotates to local frame, adds to solver's EEF position.
-    This avoids the body-FK origin mismatch.
-    """
-    # Get real gripper world position
-    real_grip = None
-    if (self._shared_state is not None
-            and self._shared_state.get("real_gripper_world")):
-        real_grip = np.array(self._shared_state["real_gripper_world"])
-
-    T = self._get_real_arm_base_T()
-
-    if real_grip is not None and T is not None:
-        # World-frame error vector
-        world_error = target_world - real_grip
-        # Rotate to arm_base local frame (T[:3,:3] maps local→world,
-        # so its transpose maps world→local)
-        R_inv = T[:3, :3].T
-        local_error = R_inv @ world_error
-        # Add to current solver EEF position
-        return np.array(obs["r_eef_pos"]) + local_error
-
-    # Fallback to old method
-    return self._corrected_world_to_arm(target_world, obs)
-```
-
-#### Change 2: Update `_phase_approach` — use new method
-
-Replace line 624:
-```python
-target_l = self._corrected_world_to_arm(target_w, obs)
-```
-With:
-```python
-target_l = self._world_target_to_solver_frame(target_w, obs)
-```
-
-#### Change 3: Update `_phase_grasp` — use new method in all 3 sub-phases
-
-Replace line 658 (lowering):
-```python
-target_l = self._corrected_world_to_arm(target_w, obs)
-```
-With:
-```python
-target_l = self._world_target_to_solver_frame(target_w, obs)
-```
-
-Replace line 683 (lifting):
-```python
-target_l = self._corrected_world_to_arm(target_w, obs)
-```
-With:
-```python
-target_l = self._world_target_to_solver_frame(target_w, obs)
-```
-
-#### Change 4: Update `_phase_move_to_scanner` — use new method
-
-Find all `_corrected_world_to_arm` calls in `_phase_move_to_scanner` and replace with `_world_target_to_solver_frame`.
-
-#### Change 5: Update all remaining phases (`_phase_regrasp`, `_phase_move_to_bin`)
-
-Find ALL remaining calls to `_corrected_world_to_arm` in phase handlers and replace with `_world_target_to_solver_frame`. The `_corrected_world_to_arm` method itself should be kept (not deleted) as a fallback inside the new method.
-
-#### Change 6: Reduce APPROACH→GRASP transition threshold
-
-Currently APPROACH transitions to GRASP after `sub_step > 500` (or `dist < 0.04`). With the frame fix, `dist` should decrease properly. Change:
+The arm starts GRASP from z = carton_z + APPROACH_HEIGHT. At 0.15m, the arm starts GRASP at z≈0.929 and must descend 0.130m. At 0.06m, it starts at z≈0.839 and only needs to descend 0.040m — well within the convergence capability.
 
 ```python
-# In _phase_approach, line 632:
-if dist < 0.04 or self.sub_step > 500:
-```
-To:
-```python
-if dist < 0.03 or self.sub_step > 300:
+APPROACH_HEIGHT = 0.06    # m above target for pre-approach (was 0.15)
 ```
 
-Also, the "holding near carton" branch (line 607-616) uses `world_dist < 0.2`. With the frame fix, the arm should move closer. Change:
-```python
-if world_dist < 0.2:
-```
-To:
-```python
-if world_dist < 0.10:
-```
-This prevents premature holding when the arm is still 0.15m away.
+This is the **most impactful single change** — it puts the arm closer to grasp height when GRASP begins.
 
-#### Change 7: Reduce gripper close distance threshold
+#### Change 2: Lower GRASP_HEIGHT from 0.02 to -0.02
 
-Currently gripper closes at `real_dist < 0.06`. With the frame fix, the arm should get much closer. Add a diagnostic print when close:
+Target the gripper 0.02m BELOW carton center. This ensures the fingers close around the carton body, not the top edge:
 
 ```python
-# In _phase_grasp, line 667:
-if real_dist < 0.06 or dist < 0.03 or self.sub_step > 300:
+GRASP_HEIGHT = -0.02      # m relative to carton center (was 0.02)
 ```
-To:
+
+At carton z=0.779, target becomes z=0.759 — firmly in the middle of the carton.
+
+#### Change 3: Tighten gripper close threshold
+
+Don't close the gripper until the gripper is truly close to the carton:
+
 ```python
-if real_dist < 0.05 or dist < 0.02 or self.sub_step > 400:
-    # Give more time for arm to converge, close at tighter distance
+# In _phase_grasp, change the close condition:
+if real_dist < 0.035 or dist < 0.015 or self.sub_step > 500:
 ```
+
+Was: `real_dist < 0.05 or dist < 0.02 or self.sub_step > 400`
+
+This gives the arm more time to descend and ensures the gripper closes at z closer to the carton center.
+
+#### Change 4: Increase EEF_STEP_SLOW for faster GRASP descent
+
+```python
+EEF_STEP_SLOW = 0.012     # m/step for precise moves (was 0.008)
+```
+
+This makes the arm descend faster during GRASP, helping it reach the target before stalling.
+
+#### Change 5: Increase IK iterations
+
+```python
+# In _compute_right_ik, change n_iter default:
+def _compute_right_ik(
+    self,
+    target_pos: np.ndarray,
+    target_rpy: np.ndarray,
+    current_arm_14: np.ndarray,
+    n_iter: int = 15,        # was 10
+) -> np.ndarray | None:
+```
+
+More iterations help the IK solver find better solutions near workspace boundaries.
+
+#### Change 6: Increase LIFT_HEIGHT for stronger PickUp signal
+
+```python
+LIFT_HEIGHT = 0.30         # m above target after grasping (was 0.22)
+```
+
+Higher lift ensures PickUpOnGripper detects the lift (> 0.02m above initial position). Also keeps the carton clear when rotating to scanner.
+
+#### Change 7: Reduce APPROACH hold threshold
+
+```python
+# In _phase_approach, line ~628:
+if world_dist < 0.06:    # was 0.10
+```
+
+With the lower APPROACH_HEIGHT (0.06m), the gripper at carton_z + 0.06 is closer to the carton. Only hold if world_dist < 0.06m to prevent premature holding.
 
 ---
 
 ## Expected Behavior After Fix
 
-1. **APPROACH**: arm_base local error correctly computed, arm converges in both x and y
-   - Yellow carton: d_world should reach < 0.05m (vs 0.105m before)
-   - Black carton: d_world should decrease steadily (vs FROZEN at 0.114m before)
+### Yellow carton:
+1. APPROACH target: z = 0.779 + 0.06 = 0.839 (was 0.929)
+2. Arm reaches z≈0.839 during APPROACH (vs z≈0.929 before)
+3. GRASP target: z = 0.779 - 0.02 = 0.759 (was 0.799)
+4. Arm descends from 0.839 to ≈0.78 (only 0.059m descent needed!)
+5. Gripper closes at real_dist < 0.035, with z ≈ 0.78 — IN the carton body
+6. Carton lifts > 0.02m → PickUpOnGripper = 1
 
-2. **GRASP**: arm descends to within 0.05m of carton (vs stalling at 0.12m)
-   - Gripper closes at real_dist < 0.05m (vs timeout at 0.126m)
-   - PickUpOnGripper should trigger if carton is actually gripped
-
-3. **Follow for black carton**: gripper should enter AABB (z range [0.679, 0.879])
-   - Currently stuck at z=0.959, needs to descend to z < 0.879
+### Black carton:
+1. APPROACH target: z = 0.779 + 0.06 = 0.839
+2. Arm still limited by workspace (0.759m reach)
+3. But lower z target reduces the reach distance slightly
+4. With EEF_STEP_SLOW=0.012, arm converges faster
+5. May reach close enough for gripper to close
 
 ---
 
 ## Verification Checklist
 
-- [ ] Yellow carton: d_world during GRASP < 0.05m (was 0.119m)
-- [ ] Yellow carton: PickUpOnGripper = 1 for at least 1 episode
-- [ ] Black carton: Follow = 1 (gripper enters AABB)
-- [ ] Black carton: arm not frozen during APPROACH
-- [ ] No `[IK] Poor convergence` messages (ik_err < 0.12)
-- [ ] `_world_target_to_solver_frame` used in all phase handlers
+- [ ] Yellow: Gripper closes at z < 0.82 (was 0.851)
+- [ ] Yellow: Carton lifts > 0.02m after grip (was 0.004m)
+- [ ] Yellow: PickUpOnGripper = 1 for at least 1 episode
+- [ ] Black: d_world < 0.08 during GRASP (was 0.096)
+- [ ] APPROACH_HEIGHT change doesn't break Follow (gripper still enters AABB)
+- [ ] GRASP_HEIGHT negative doesn't cause collision issues
 
 ---
 
 ## Priority
 
-1. **Changes 1–5**: Frame fix (fixes BUG 15 — the main reason arm stalls and PickUp fails)
-2. **Change 6**: Tighter APPROACH threshold (prevents premature holding)
-3. **Change 7**: Tighter gripper close distance
+1. **Change 1**: Lower APPROACH_HEIGHT (most impactful — reduces descent needed)
+2. **Change 2**: Lower GRASP_HEIGHT (targets carton center, not top)
+3. **Change 3**: Tighten gripper close threshold (close only when properly positioned)
+4. **Change 4**: Faster GRASP step size
+5. **Changes 5-7**: Supporting improvements
+
+---
+
+## Key Insight
+
+The arm CAN reach [0.302, 0.682, 0.851] for the yellow carton — that's only 0.072m above the carton center. With APPROACH_HEIGHT=0.06 (arm starts closer to carton height) and GRASP_HEIGHT=-0.02 (target below carton center), the arm only needs to descend 0.04m during GRASP instead of 0.13m. This is well within the arm's convergence capability, which shows ~0.06m descent in 30 steps.
