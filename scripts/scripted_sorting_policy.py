@@ -247,6 +247,30 @@ class ScriptedSortingPolicy(BasePolicy):
             return (T @ np.append(local_pos, 1.0))[:3]
         return self.arm_base_to_world(local_pos, obs["body"])
 
+    def _world_target_to_solver_frame(
+        self, target_world: np.ndarray, obs: dict,
+    ) -> np.ndarray:
+        """Convert world target to IKFKSolver's local frame.
+
+        Uses relative error: computes world displacement from real gripper
+        to target, rotates to local frame, adds to solver's EEF position.
+        This avoids the body-FK origin mismatch.
+        """
+        real_grip = None
+        if (self._shared_state is not None
+                and self._shared_state.get("real_gripper_world")):
+            real_grip = np.array(self._shared_state["real_gripper_world"])
+
+        T = self._get_real_arm_base_T()
+
+        if real_grip is not None and T is not None:
+            world_error = target_world - real_grip
+            R_inv = T[:3, :3].T
+            local_error = R_inv @ world_error
+            return np.array(obs["r_eef_pos"]) + local_error
+
+        return self._corrected_world_to_arm(target_world, obs)
+
     # ── bj5 computation ──────────────────────────────────────────────
 
     def _compute_bj5_for_target(self, target_world: np.ndarray) -> float:
@@ -604,7 +628,7 @@ class ScriptedSortingPolicy(BasePolicy):
 
         # If gripper is already close (within Follow AABB ~0.2m),
         # hold position — don't risk moving away with broken FK
-        if world_dist < 0.2:
+        if world_dist < 0.10:
             bj5_target = self._bj5_table
             new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
             action = self._build_action(
@@ -621,7 +645,7 @@ class ScriptedSortingPolicy(BasePolicy):
 
         target_w = self._carton_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
+        target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -629,7 +653,7 @@ class ScriptedSortingPolicy(BasePolicy):
         action = self._build_action(obs["left_arm"], new_joints, new_bj5)
         self._log(obs, target_w, "approach_moving")
 
-        if dist < 0.04 or self.sub_step > 500:
+        if dist < 0.03 or self.sub_step > 300:
             self._set_phase("GRASP")
         return action
 
@@ -655,7 +679,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.right_grip < 0.5:
             target_w = self._carton_pos.copy()
             target_w[2] += self.GRASP_HEIGHT
-            target_l = self._corrected_world_to_arm(target_w, obs)
+            target_l = self._world_target_to_solver_frame(target_w, obs)
             new_joints, dist = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -664,7 +688,7 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, target_w, "lowering")
 
             # Close gripper when real distance is small enough
-            if real_dist < 0.06 or dist < 0.03 or self.sub_step > 300:
+            if real_dist < 0.05 or dist < 0.02 or self.sub_step > 400:
                 self.right_grip = 1.0
                 self.sub_step = 0  # reset for hold counting
                 print(f"[Policy] Gripper closing at step {self.step_count}"
@@ -680,7 +704,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 3: lift carton
         target_w = self._carton_pos.copy()
         target_w[2] += self.LIFT_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
+        target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -712,7 +736,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 2: move above scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
+        target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist_above = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -728,7 +752,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 3: lower onto scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.GRASP_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
+        target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -762,7 +786,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.sub_step <= 80:
             target_w = self._scanner_pos.copy()
             target_w[2] += self.APPROACH_HEIGHT
-            target_l = self._corrected_world_to_arm(target_w, obs)
+            target_l = self._world_target_to_solver_frame(target_w, obs)
             new_joints, _ = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -779,7 +803,7 @@ class ScriptedSortingPolicy(BasePolicy):
         if self.right_grip < 0.5:
             target_w = self._scanner_pos.copy()
             target_w[2] += self.GRASP_HEIGHT
-            target_l = self._corrected_world_to_arm(target_w, obs)
+            target_l = self._world_target_to_solver_frame(target_w, obs)
             new_joints, dist = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_SLOW,
@@ -802,7 +826,7 @@ class ScriptedSortingPolicy(BasePolicy):
         # Sub 5: lift from scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.LIFT_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
+        target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
@@ -837,7 +861,7 @@ class ScriptedSortingPolicy(BasePolicy):
         to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
         reach_w = arm_w_real + to_bin_dir * 0.65
         reach_w[2] = max(self._bin_pos[2] + 0.15, reach_w[2])
-        target_l = self._corrected_world_to_arm(reach_w, obs)
+        target_l = self._world_target_to_solver_frame(reach_w, obs)
 
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
