@@ -217,10 +217,11 @@ class ScriptedSortingPolicy(BasePolicy):
         else:
             rot_mat = np.eye(3)
 
-        # Apply ARM_BASE_RPY offset (arm_base frame is rotated
-        # relative to the link frame)
-        rpy_rot = self._rot('x', self.ARM_BASE_RPY[0])
-        rot_mat = rot_mat @ rpy_rot
+        # NOTE: Do NOT apply ARM_BASE_RPY — the queried prim pose
+        # already includes the link's full orientation. Applying
+        # an extra -pi/2 rotation causes directional errors.
+        # rpy_rot = self._rot('x', self.ARM_BASE_RPY[0])
+        # rot_mat = rot_mat @ rpy_rot
 
         T = np.eye(4)
         T[:3, :3] = rot_mat
@@ -529,6 +530,25 @@ class ScriptedSortingPolicy(BasePolicy):
             self._resolve_carton_from_instruction(instruction)
             # No bj5 rotation needed for approach — carton is in front
 
+        # Update carton position from real-time simulation query
+        if (self._shared_state is not None
+                and self._shared_state.get("real_carton_world")):
+            new_pos = np.array(self._shared_state["real_carton_world"])
+            if self._carton_pos is not None:
+                diff = np.linalg.norm(new_pos - self._carton_pos)
+                if diff > 0.01:
+                    if self.step_count <= 5:
+                        print(f"[Policy] Carton pos updated: "
+                              f"{self._carton_pos} → {new_pos} "
+                              f"(diff={diff:.3f}m)")
+                    self._carton_pos = new_pos
+                    # Recompute bj5 for updated carton position
+                    self._bj5_table = self._compute_bj5_for_target(
+                        self._carton_pos
+                    )
+            else:
+                self._carton_pos = new_pos
+
         # Fallback positions if not set
         if self._carton_pos is None:
             self._carton_pos = np.array([0.017, 0.613, 1.19])
@@ -621,6 +641,16 @@ class ScriptedSortingPolicy(BasePolicy):
     def _phase_grasp(self, obs: dict) -> np.ndarray:
         bj5_hold = obs["bj5"]  # keep current waist angle
 
+        # Get real-time distance to carton
+        real_grip = None
+        if (self._shared_state is not None
+                and self._shared_state.get("real_gripper_world")):
+            real_grip = np.array(self._shared_state["real_gripper_world"])
+        if real_grip is not None:
+            real_dist = np.linalg.norm(real_grip - self._carton_pos)
+        else:
+            real_dist = float('inf')
+
         # Sub 1: lower to carton
         if self.right_grip < 0.5:
             target_w = self._carton_pos.copy()
@@ -633,11 +663,12 @@ class ScriptedSortingPolicy(BasePolicy):
             action = self._build_action(obs["left_arm"], new_joints, bj5_hold)
             self._log(obs, target_w, "lowering")
 
-            if dist < 0.03 or self.sub_step > 300:
-                # Close gripper
+            # Close gripper when real distance is small enough
+            if real_dist < 0.06 or dist < 0.03 or self.sub_step > 300:
                 self.right_grip = 1.0
                 self.sub_step = 0  # reset for hold counting
-                print(f"[Policy] Gripper closing at step {self.step_count}")
+                print(f"[Policy] Gripper closing at step {self.step_count}"
+                      f" real_dist={real_dist:.3f}")
             return action
 
         # Sub 2: hold gripper closed

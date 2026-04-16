@@ -532,6 +532,12 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     _diag_carton_name = target_carton_name
                     _shared_state = {"real_gripper_world": None}
 
+                    # Carton prim path for real-time position tracking
+                    _carton_prim_path = None
+                    if target_carton_name:
+                        _carton_prim_path = f"/Workspace/Objects/{target_carton_name}"
+                        print(f"[Patch] Carton prim path: {_carton_prim_path}")
+
                     # Pass shared state to policy for closed-loop
                     if hasattr(self, 'policy') and self.policy is not None:
                         self.policy._shared_state = _shared_state
@@ -568,6 +574,19 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                             ]
                         except Exception:
                             pass
+
+                        # Query real carton position EVERY step
+                        if _carton_prim_path:
+                            try:
+                                cp, _ = _env.api_core.get_obj_world_pose(
+                                    _carton_prim_path
+                                )
+                                _shared_state["real_carton_world"] = [
+                                    float(cp[0]), float(cp[1]),
+                                    float(cp[2]),
+                                ]
+                            except Exception:
+                                pass
 
                         # Step 1: enumerate /genie/ prims, find arm_base
                         if _step_counter[0] == 1:
