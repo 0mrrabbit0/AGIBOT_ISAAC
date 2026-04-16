@@ -192,56 +192,71 @@ class ScriptedSortingPolicy(BasePolicy):
         T = self._world_to_arm_T(body_joints)
         return (T @ np.append(local_pos, 1.0))[:3]
 
-    # ── Closed-loop FK correction ────────────────────────────────────
+    # ── Real arm_base transform from simulation ───────────────────────
 
-    def _get_fk_correction(self, obs: dict) -> np.ndarray:
-        """Correction vector: real_gripper_world - fk_gripper_world.
+    def _get_real_arm_base_T(self) -> np.ndarray | None:
+        """Get real arm_base → world transform from sim prim query.
 
-        Compensates body_fk / ROBOT_BASE errors so IK targets are accurate.
+        Returns 4x4 homogeneous transform, or None if not available.
         """
         if self._shared_state is None:
-            return np.zeros(3)
-        real_grip = self._shared_state.get("real_gripper_world")
-        if real_grip is None:
-            return np.zeros(3)
-        real_grip = np.array(real_grip)
-        fk_grip = self.arm_base_to_world(obs["r_eef_pos"], obs["body"])
-        return real_grip - fk_grip
+            return None
+        ab_pos = self._shared_state.get("arm_base_pos")
+        ab_rot = self._shared_state.get("arm_base_rot")
+        if ab_pos is None or ab_rot is None:
+            return None
+
+        pos = np.array(ab_pos)
+        qw, qx, qy, qz = ab_rot
+        if R is not None:
+            rot_mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
+        else:
+            rot_mat = np.eye(3)
+
+        # Apply ARM_BASE_RPY offset (arm_base frame is rotated
+        # relative to the link frame)
+        rpy_rot = self._rot('x', self.ARM_BASE_RPY[0])
+        rot_mat = rot_mat @ rpy_rot
+
+        T = np.eye(4)
+        T[:3, :3] = rot_mat
+        T[:3, 3] = pos
+        return T
 
     def _corrected_world_to_arm(
         self, world_pos: np.ndarray, obs: dict,
     ) -> np.ndarray:
-        """world → arm_base_link with FK correction applied."""
-        correction = self._get_fk_correction(obs)
-        adjusted = world_pos - correction
-        return self.world_to_arm_base(adjusted, obs["body"])
+        """world → arm_base_link using real sim transform if available."""
+        T = self._get_real_arm_base_T()
+        if T is not None:
+            T_inv = np.linalg.inv(T)
+            return (T_inv @ np.append(world_pos, 1.0))[:3]
+        return self.world_to_arm_base(world_pos, obs["body"])
+
+    def _corrected_arm_to_world(
+        self, local_pos: np.ndarray, obs: dict,
+    ) -> np.ndarray:
+        """arm_base_link → world using real sim transform if available."""
+        T = self._get_real_arm_base_T()
+        if T is not None:
+            return (T @ np.append(local_pos, 1.0))[:3]
+        return self.arm_base_to_world(local_pos, obs["body"])
 
     # ── bj5 computation ──────────────────────────────────────────────
 
     def _compute_bj5_for_target(self, target_world: np.ndarray) -> float:
-        """Find bj5 angle that places the target within right-arm reach.
+        """Find bj5 angle that points the robot toward the target.
 
-        Sweeps bj5 candidates to find the one where the target is closest
-        to the right arm's reachable zone in the arm_base_link frame.
+        Simple geometric approach: atan2 from robot base to target in
+        the world xy plane. No body FK needed.
+
+        At init bj5=1.57 (pi/2), the robot faces roughly +y.
+        atan2(dy, dx) gives the world-frame yaw to the target.
         """
-        best_bj5 = self.INIT_BODY[4]
-        best_score = float('inf')
-        body = self.INIT_BODY.copy()
-
-        for bj5 in np.linspace(-3.1, 3.1, 120):
-            body[4] = bj5
-            local = self.world_to_arm_base(target_world, body)
-            # Right arm reaches in roughly +x direction in arm_base_link
-            # Penalize lateral offset (y) and prefer targets in front (x>0)
-            if local[0] < 0:
-                continue
-            horiz_dist = np.sqrt(local[0] ** 2 + local[1] ** 2)
-            score = abs(local[1]) + 0.3 * abs(horiz_dist - 0.35)
-            if score < best_score:
-                best_score = score
-                best_bj5 = bj5
-
-        return best_bj5
+        dx = target_world[0] - self.ROBOT_BASE[0]
+        dy = target_world[1] - self.ROBOT_BASE[1]
+        angle = np.arctan2(dy, dx)
+        return np.clip(angle, -3.1, 3.1)
 
     # ── IK helpers ───────────────────────────────────────────────────
 
@@ -396,7 +411,6 @@ class ScriptedSortingPolicy(BasePolicy):
     def _log(self, obs: dict, target_world: np.ndarray | None = None, label: str = "") -> None:
         if self.step_count % 30 != 0:
             return
-        correction = self._get_fk_correction(obs)
         real_grip = (
             self._shared_state.get("real_gripper_world")
             if self._shared_state else None
@@ -404,17 +418,21 @@ class ScriptedSortingPolicy(BasePolicy):
         if real_grip is not None:
             rg = np.array(real_grip)
             msg = (f"[s={self.step_count}] {self.phase}:{self.sub_step} "
-                   f"eef_real=[{rg[0]:.3f},{rg[1]:.3f},{rg[2]:.3f}]"
-                   f" corr=[{correction[0]:.3f},{correction[1]:.3f},{correction[2]:.3f}]")
+                   f"eef_real=[{rg[0]:.3f},{rg[1]:.3f},{rg[2]:.3f}]")
         else:
             eef_w = self.arm_base_to_world(obs["r_eef_pos"], obs["body"])
             msg = (f"[s={self.step_count}] {self.phase}:{self.sub_step} "
                    f"eef_w=[{eef_w[0]:.3f},{eef_w[1]:.3f},{eef_w[2]:.3f}]")
         if target_world is not None:
-            tgt_l = self._corrected_world_to_arm(target_world, obs)
-            d = np.linalg.norm(tgt_l - obs["r_eef_pos"])
-            msg += (f" tgt=[{target_world[0]:.3f},{target_world[1]:.3f},"
-                    f"{target_world[2]:.3f}] d={d:.3f}")
+            if real_grip is not None:
+                d_world = np.linalg.norm(np.array(real_grip) - target_world)
+                msg += (f" tgt=[{target_world[0]:.3f},{target_world[1]:.3f},"
+                        f"{target_world[2]:.3f}] d_world={d_world:.3f}")
+            else:
+                tgt_l = self.world_to_arm_base(target_world, obs["body"])
+                d = np.linalg.norm(tgt_l - obs["r_eef_pos"])
+                msg += (f" tgt=[{target_world[0]:.3f},{target_world[1]:.3f},"
+                        f"{target_world[2]:.3f}] d_fk={d:.3f}")
         if label:
             msg += f" [{label}]"
         print(msg)
@@ -450,12 +468,14 @@ class ScriptedSortingPolicy(BasePolicy):
             print(f"  body_fk arm_base (INIT): {init_arm_base}")
             obs_arm_base = self.body_fk(obs["body"])[:3, 3] + self.ROBOT_BASE
             print(f"  body_fk arm_base (obs):  {obs_arm_base}")
-        # Show FK correction if available
-        correction = self._get_fk_correction(obs)
-        if np.linalg.norm(correction) > 0.01:
-            print(f"  FK correction: [{correction[0]:.4f}, "
-                  f"{correction[1]:.4f}, {correction[2]:.4f}]")
-            print(f"  ||correction||: {np.linalg.norm(correction):.4f}m")
+        # Show real arm_base transform if available
+        T_real = self._get_real_arm_base_T()
+        if T_real is not None:
+            print(f"  real arm_base pos: {T_real[:3, 3]}")
+            eef_corrected = self._corrected_arm_to_world(
+                obs["r_eef_pos"], obs,
+            )
+            print(f"  EEF world (corrected): {eef_corrected}")
         print("=" * 60)
 
     # ── Detect target carton from instruction ────────────────────────
@@ -550,11 +570,31 @@ class ScriptedSortingPolicy(BasePolicy):
     # ════════════════════════════════════════════════════════════════
 
     def _phase_approach(self, obs: dict) -> np.ndarray:
-        # Rotate bj5 toward table while approaching
+        # Check real gripper distance to carton in world frame
+        real_grip = None
+        world_dist = float('inf')
+        if (self._shared_state is not None
+                and self._shared_state.get("real_gripper_world")):
+            real_grip = np.array(self._shared_state["real_gripper_world"])
+            world_dist = np.linalg.norm(real_grip - self._carton_pos)
+
+        # If gripper is already close (within Follow AABB ~0.2m),
+        # hold position — don't risk moving away with broken FK
+        if world_dist < 0.2:
+            bj5_target = self._bj5_table
+            new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
+            action = self._build_action(
+                obs["left_arm"], self.last_right_arm, new_bj5,
+            )
+            self._log(obs, self._carton_pos, "holding_near_carton")
+            if self.sub_step > 100:
+                self._set_phase("GRASP")
+            return action
+
+        # Otherwise, try to move toward carton
         bj5_target = self._bj5_table
         new_bj5 = self._smooth_bj5(obs["bj5"], bj5_target, self.BJ5_SPEED)
 
-        # Move EEF above carton
         target_w = self._carton_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
         target_l = self._corrected_world_to_arm(target_w, obs)
@@ -563,7 +603,7 @@ class ScriptedSortingPolicy(BasePolicy):
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
         )
         action = self._build_action(obs["left_arm"], new_joints, new_bj5)
-        self._log(obs, target_w, "above_carton")
+        self._log(obs, target_w, "approach_moving")
 
         if dist < 0.04 or self.sub_step > 500:
             self._set_phase("GRASP")
@@ -757,8 +797,7 @@ class ScriptedSortingPolicy(BasePolicy):
             return action
 
         # Sub 2: extend arm toward bin (may not fully reach, that's OK)
-        correction = self._get_fk_correction(obs)
-        arm_w_real = self.arm_base_to_world(np.zeros(3), obs["body"]) + correction
+        arm_w_real = self._corrected_arm_to_world(np.zeros(3), obs)
         to_bin = self._bin_pos - arm_w_real
         to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
         reach_w = arm_w_real + to_bin_dir * 0.65

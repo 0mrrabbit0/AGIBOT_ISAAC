@@ -557,16 +557,78 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                 is_trajectory=True,
                             )
 
-                        # Query real gripper EVERY step for closed-loop
+                        # Query real gripper EVERY step
                         try:
                             rp, _ = _env.api_core.get_obj_world_pose(
                                 "/genie/gripper_r_center_link"
                             )
                             _shared_state["real_gripper_world"] = [
-                                float(rp[0]), float(rp[1]), float(rp[2])
+                                float(rp[0]), float(rp[1]),
+                                float(rp[2]),
                             ]
                         except Exception:
                             pass
+
+                        # Step 1: enumerate /genie/ prims, find arm_base
+                        if _step_counter[0] == 1:
+                            try:
+                                stage = _env.api_core._stage
+                                gp = stage.GetPrimAtPath("/genie")
+                                if gp.IsValid():
+                                    links = []
+                                    for c in gp.GetChildren():
+                                        n = c.GetName()
+                                        if any(k in n.lower() for k in
+                                               ["arm", "base", "link"]):
+                                            links.append(n)
+                                    print(f"[Enum] /genie/ links "
+                                          f"({len(links)}): {links}")
+                            except Exception as e:
+                                print(f"[Enum] failed: {e}")
+
+                            for cand in [
+                                "/genie/arm_r_base_link",
+                                "/genie/right_arm_base_link",
+                                "/genie/arm_base_link",
+                                "/genie/torso_arm_r_base_link",
+                                "/genie/link_arm_r_base",
+                                "/genie/arm_r_link0",
+                            ]:
+                                try:
+                                    ab_p, ab_r = (
+                                        _env.api_core
+                                        .get_obj_world_pose(cand)
+                                    )
+                                    print(f"[ArmBase] FOUND: {cand}")
+                                    print(f"  pos=[{ab_p[0]:.4f},"
+                                          f"{ab_p[1]:.4f},"
+                                          f"{ab_p[2]:.4f}]")
+                                    print(f"  rot=[{ab_r[0]:.4f},"
+                                          f"{ab_r[1]:.4f},"
+                                          f"{ab_r[2]:.4f},"
+                                          f"{ab_r[3]:.4f}]")
+                                    _shared_state["arm_base_prim"] = cand
+                                    _shared_state["arm_base_pos"] = [
+                                        float(ab_p[i]) for i in range(3)
+                                    ]
+                                    _shared_state["arm_base_rot"] = [
+                                        float(ab_r[i]) for i in range(4)
+                                    ]
+                                    break
+                                except Exception:
+                                    continue
+                            if "arm_base_prim" not in _shared_state:
+                                print("[ArmBase] No candidate found")
+
+                            try:
+                                lp, _ = _env.api_core.get_obj_world_pose(
+                                    "/genie/gripper_l_center_link"
+                                )
+                                print(f"[Calib] left_grip="
+                                      f"[{lp[0]:.4f},{lp[1]:.4f},"
+                                      f"{lp[2]:.4f}]")
+                            except Exception:
+                                pass
 
                         # Diagnostic logging every 30 steps
                         if _step_counter[0] % 30 == 1:
@@ -600,6 +662,23 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                         except Exception:
                                             continue
                                 print(msg)
+
+                        # Update arm_base world pose each step
+                        if _shared_state.get("arm_base_prim"):
+                            try:
+                                ab_p, ab_r = (
+                                    _env.api_core.get_obj_world_pose(
+                                        _shared_state["arm_base_prim"]
+                                    )
+                                )
+                                _shared_state["arm_base_pos"] = [
+                                    float(ab_p[i]) for i in range(3)
+                                ]
+                                _shared_state["arm_base_rot"] = [
+                                    float(ab_r[i]) for i in range(4)
+                                ]
+                            except Exception:
+                                pass
 
                         return result
 
