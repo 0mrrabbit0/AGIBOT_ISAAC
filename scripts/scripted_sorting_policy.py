@@ -71,7 +71,7 @@ class ScriptedSortingPolicy(BasePolicy):
     ARM_BASE_RPY = np.array([-np.pi / 2, 0, 0])
 
     # ── Motion parameters ────────────────────────────────────────────
-    BJ5_SPEED = 0.04          # rad/step for waist rotation
+    BJ5_SPEED = 0.06          # rad/step for waist rotation
     EEF_STEP_FAST = 0.018     # m/step for fast moves
     EEF_STEP_SLOW = 0.012     # m/step for precise moves
     APPROACH_HEIGHT = 0.06    # m above target for pre-approach
@@ -742,7 +742,7 @@ class ScriptedSortingPolicy(BasePolicy):
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
         )
 
-        if dist_above > 0.05 and self.sub_step < 500:
+        if dist_above > 0.05 and self.sub_step < 280:
             action = self._build_action(
                 obs["left_arm"], new_joints, self._bj5_scanner, grip=1.0,
             )
@@ -758,7 +758,7 @@ class ScriptedSortingPolicy(BasePolicy):
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
         )
 
-        if dist > 0.03 and self.sub_step < 700:
+        if dist > 0.03 and self.sub_step < 380:
             action = self._build_action(
                 obs["left_arm"], new_joints, self._bj5_scanner, grip=1.0,
             )
@@ -770,7 +770,7 @@ class ScriptedSortingPolicy(BasePolicy):
         action = self._build_action(
             obs["left_arm"], self.last_right_arm, self._bj5_scanner, grip=0.0,
         )
-        if self.sub_step > 700 + self.RELEASE_HOLD_STEPS:
+        if self.sub_step > 380 + self.RELEASE_HOLD_STEPS:
             self._set_phase("REGRASP")
         return action
 
@@ -782,26 +782,49 @@ class ScriptedSortingPolicy(BasePolicy):
     def _phase_regrasp(self, obs: dict) -> np.ndarray:
         bj5_hold = self._bj5_scanner
 
-        # Sub 1: lift hand above scanner (clear the carton)
-        if self.sub_step <= 80:
-            target_w = self._scanner_pos.copy()
-            target_w[2] += self.APPROACH_HEIGHT
+        # Determine actual carton position for re-grasping
+        regrasp_target = self._scanner_pos.copy()
+        if (self._shared_state is not None
+                and self._shared_state.get("real_carton_world")):
+            regrasp_target = np.array(self._shared_state["real_carton_world"])
+            bj5_hold = self._compute_bj5_for_target(regrasp_target)
+
+        # Sub 1: lift hand (clear area above carton)
+        if self.sub_step <= 50:
+            target_w = regrasp_target.copy()
+            target_w[2] += self.APPROACH_HEIGHT + 0.10
             target_l = self._world_target_to_solver_frame(target_w, obs)
+            new_bj5 = self._smooth_bj5(obs["bj5"], bj5_hold, self.BJ5_SPEED)
             new_joints, _ = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_FAST,
             )
-            return self._build_action(obs["left_arm"], new_joints, bj5_hold, grip=0.0)
+            return self._build_action(obs["left_arm"], new_joints, new_bj5, grip=0.0)
 
         # Sub 2: wait for carton to settle
-        if self.sub_step <= 140:
+        if self.sub_step <= 80:
+            new_bj5 = self._smooth_bj5(obs["bj5"], bj5_hold, self.BJ5_SPEED)
             return self._build_action(
-                obs["left_arm"], self.last_right_arm, bj5_hold, grip=0.0,
+                obs["left_arm"], self.last_right_arm, new_bj5, grip=0.0,
             )
 
-        # Sub 3: lower to carton on scanner
+        # Sub 3: approach above carton
+        if self.sub_step <= 160:
+            target_w = regrasp_target.copy()
+            target_w[2] += self.APPROACH_HEIGHT
+            target_l = self._world_target_to_solver_frame(target_w, obs)
+            new_bj5 = self._smooth_bj5(obs["bj5"], bj5_hold, self.BJ5_SPEED)
+            new_joints, _ = self._move_right_toward(
+                target_l, obs["r_eef_pos"], obs["r_eef_quat"],
+                obs["arm_14"], step_size=self.EEF_STEP_FAST,
+            )
+            action = self._build_action(obs["left_arm"], new_joints, new_bj5, grip=0.0)
+            self._log(obs, target_w, "regrasp_above")
+            return action
+
+        # Sub 4: lower to carton
         if self.right_grip < 0.5:
-            target_w = self._scanner_pos.copy()
+            target_w = regrasp_target.copy()
             target_w[2] += self.GRASP_HEIGHT
             target_l = self._world_target_to_solver_frame(target_w, obs)
             new_joints, dist = self._move_right_toward(
@@ -811,20 +834,28 @@ class ScriptedSortingPolicy(BasePolicy):
             action = self._build_action(obs["left_arm"], new_joints, bj5_hold, grip=0.0)
             self._log(obs, target_w, "regrasp_lower")
 
-            if dist < 0.03 or self.sub_step > 350:
+            real_grip = None
+            if (self._shared_state is not None
+                    and self._shared_state.get("real_gripper_world")):
+                real_grip = np.array(self._shared_state["real_gripper_world"])
+            real_dist = (np.linalg.norm(real_grip - regrasp_target)
+                         if real_grip is not None else float('inf'))
+
+            if real_dist < 0.04 or dist < 0.02 or self.sub_step > 380:
                 self.right_grip = 1.0
-                self.sub_step = 350  # sync for hold counting
-                print(f"[Policy] Re-grasp closing at step {self.step_count}")
+                self.sub_step = 380
+                print(f"[Policy] Re-grasp closing at step {self.step_count}"
+                      f" real_dist={real_dist:.3f}")
             return action
 
-        # Sub 4: hold
-        if self.sub_step <= 350 + self.GRASP_HOLD_STEPS:
+        # Sub 5: hold
+        if self.sub_step <= 380 + self.GRASP_HOLD_STEPS:
             return self._build_action(
                 obs["left_arm"], self.last_right_arm, bj5_hold, grip=1.0,
             )
 
-        # Sub 5: lift from scanner
-        target_w = self._scanner_pos.copy()
+        # Sub 6: lift from ground
+        target_w = regrasp_target.copy()
         target_w[2] += self.LIFT_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
@@ -834,7 +865,7 @@ class ScriptedSortingPolicy(BasePolicy):
         action = self._build_action(obs["left_arm"], new_joints, bj5_hold, grip=1.0)
         self._log(obs, target_w, "regrasp_lift")
 
-        if dist < 0.05 or self.sub_step > 350 + self.GRASP_HOLD_STEPS + 200:
+        if dist < 0.05 or self.sub_step > 380 + self.GRASP_HOLD_STEPS + 150:
             self._set_phase("MOVE_TO_BIN")
         return action
 
@@ -847,7 +878,7 @@ class ScriptedSortingPolicy(BasePolicy):
         bj5 = obs["bj5"]
 
         # Sub 1: rotate waist to bin
-        if abs(bj5 - self._bj5_bin) > 0.05 and self.sub_step < 150:
+        if abs(bj5 - self._bj5_bin) > 0.05 and self.sub_step < 120:
             new_bj5 = self._smooth_bj5(bj5, self._bj5_bin, self.BJ5_SPEED)
             action = self._build_action(
                 obs["left_arm"], self.last_right_arm, new_bj5, grip=1.0,
@@ -868,7 +899,7 @@ class ScriptedSortingPolicy(BasePolicy):
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
         )
 
-        if dist > 0.06 and self.sub_step < 400:
+        if dist > 0.06 and self.sub_step < 250:
             action = self._build_action(
                 obs["left_arm"], new_joints, self._bj5_bin, grip=1.0,
             )
@@ -880,7 +911,7 @@ class ScriptedSortingPolicy(BasePolicy):
         action = self._build_action(
             obs["left_arm"], self.last_right_arm, self._bj5_bin, grip=0.0,
         )
-        if self.sub_step > 400 + self.RELEASE_HOLD_STEPS:
+        if self.sub_step > 250 + self.RELEASE_HOLD_STEPS:
             self._set_phase("RETURN")
         return action
 
