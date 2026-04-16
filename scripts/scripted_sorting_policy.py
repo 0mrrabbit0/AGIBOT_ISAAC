@@ -208,6 +208,10 @@ class ScriptedSortingPolicy(BasePolicy):
 
         pos = np.array(ab_pos)
         qw, qx, qy, qz = ab_rot
+        # Guard against zero quaternion
+        qnorm = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
+        if qnorm < 0.01:
+            return None
         if R is not None:
             rot_mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
         else:

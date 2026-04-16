@@ -587,18 +587,25 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                 print(f"[Enum] failed: {e}")
 
                             for cand in [
-                                "/genie/arm_r_base_link",
-                                "/genie/right_arm_base_link",
                                 "/genie/arm_base_link",
-                                "/genie/torso_arm_r_base_link",
-                                "/genie/link_arm_r_base",
-                                "/genie/arm_r_link0",
+                                "/genie/arm_r_base_link",
+                                "/genie/arm_r_link1",
                             ]:
                                 try:
                                     ab_p, ab_r = (
                                         _env.api_core
                                         .get_obj_world_pose(cand)
                                     )
+                                    # Skip zero quaternions
+                                    import math
+                                    qnorm = math.sqrt(sum(
+                                        float(ab_r[i]) ** 2
+                                        for i in range(4)
+                                    ))
+                                    if qnorm < 0.01:
+                                        print(f"[ArmBase] {cand}: "
+                                              f"zero quat, skip")
+                                        continue
                                     print(f"[ArmBase] FOUND: {cand}")
                                     print(f"  pos=[{ab_p[0]:.4f},"
                                           f"{ab_p[1]:.4f},"
