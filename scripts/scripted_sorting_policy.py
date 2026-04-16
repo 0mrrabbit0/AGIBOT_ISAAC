@@ -80,6 +80,11 @@ class ScriptedSortingPolicy(BasePolicy):
     GRASP_HOLD_STEPS = 35     # steps to hold gripper closed
     RELEASE_HOLD_STEPS = 30   # steps to hold gripper open
 
+    # ── Body lean for extended reach ─────────────────────────────────
+    BJ2_INIT = 1.344          # initial bj2 value (from body_state)
+    BJ2_LEAN_OFFSET = 0.27    # radians forward lean (~0.06m reach extension)
+    BJ2_LEAN = BJ2_INIT + BJ2_LEAN_OFFSET  # = 1.614
+
     def __init__(self, task_name: str = "", sub_task_name: str = "") -> None:
         super().__init__(task_name=task_name, sub_task_name=sub_task_name)
 
@@ -434,6 +439,12 @@ class ScriptedSortingPolicy(BasePolicy):
               f"(step={self.step_count}, sub={self.sub_step})")
         self.phase = name
         self.sub_step = 0
+        # Body lean control via shared state
+        if self._shared_state is not None:
+            if name in ("APPROACH", "GRASP", "MOVE_TO_SCANNER", "REGRASP"):
+                self._shared_state["desired_bj2"] = self.BJ2_LEAN
+            elif name in ("MOVE_TO_BIN", "RETURN", "DONE"):
+                self._shared_state["desired_bj2"] = self.BJ2_INIT
 
     # ── Debug logging ────────────────────────────────────────────────
 

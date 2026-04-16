@@ -530,7 +530,7 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                     _body_indices_cache = []
                     _step_counter = [0]
                     _diag_carton_name = target_carton_name
-                    _shared_state = {"real_gripper_world": None}
+                    _shared_state = {"real_gripper_world": None, "desired_bj2": _bs[3]}
 
                     # Carton prim path for real-time position tracking
                     _carton_prim_path = None
@@ -557,6 +557,13 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                 print(f"[Patch] bj1-bj4 hold active: "
                                       f"indices={_body_indices_cache}")
                         if _body_indices_cache:
+                            # Dynamic bj2 control — ramp toward desired value
+                            _desired_bj2 = _shared_state.get("desired_bj2", _body_hold[1])
+                            if abs(_desired_bj2 - _body_hold[1]) > 0.005:
+                                _bj2_delta = min(0.01, abs(_desired_bj2 - _body_hold[1]))
+                                _body_hold[1] += _bj2_delta if _desired_bj2 > _body_hold[1] else -_bj2_delta
+                                if _step_counter[0] % 30 == 0:
+                                    print(f"[Patch] bj2 ramping: current={_body_hold[1]:.3f} target={_desired_bj2:.3f}")
                             _env.api_core.set_joint_positions(
                                 [float(v) for v in _body_hold],
                                 joint_indices=_body_indices_cache,
