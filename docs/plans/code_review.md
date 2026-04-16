@@ -1,4 +1,4 @@
-# Code Review & Modification Suggestions (Round 8)
+# Code Review & Modification Suggestions (Round 9)
 
 **Date**: 2026-04-16
 **Reviewer**: Local Claude Code (Evaluation)
@@ -6,247 +6,235 @@
 
 ---
 
-## Round 7 Result: 0 score, but MASSIVE progress
+## Round 8 Result: FOLLOW = 1.0 for yellow carton! Average = 0.0833
 
-Commit `916c99c` + local hotfix (zero-quat guard, prim ordering).
+### Scores (8 episodes)
+
+| Episode | Carton | Follow | PickUp | Inside | Upright | PickUp2 | Inside2 |
+|---------|--------|--------|--------|--------|---------|---------|---------|
+| 1–4     | Yellow | **1.0** | 0 | 0 | 0 | 0 | 0 |
+| 5–8     | Black  | 0      | 0 | 0 | 0 | 0 | 0 |
+
+**Average: 0.0833** (4 Follow successes × 1 point / 48 total)
 
 ### What Works Now
 
-1. **`/genie/arm_base_link` found!** Real transform available:
-   - pos=[0.1374, 0.0933, 1.1451]
-   - rot=[-0.4949, 0.5054, 0.5050, -0.4945]
-2. **bj5 computation correct!** bj5=1.431 for carton (was 3.048 before)
-3. **APPROACH holds correctly** when d_world < 0.2 (gripper stays at [0.453, 0.600, 1.213])
-4. **Arm converges toward target!** d_world: 0.191 → 0.078 → **0.037** in GRASP
-5. **MOVE_TO_SCANNER waist rotation works!** d_world: 1.025 → 0.178
-
-### Root Cause: Carton Position Stale After Physics Settle
-
-**BUG 13 [CRITICAL]**: The carton position is queried at scene setup (before physics runs). But cartons FALL under gravity and settle at different z positions.
-
-```
-Setup query:  carton z = 1.097  (before physics)
-Runtime step 1: carton z = 0.779  (after physics settle)
-Height error:  0.318 m !!!
-```
-
-The arm moves to z≈1.097 (the stale target) while the carton is actually at z≈0.779. The arm is 0.32m above the carton. **Follow evaluator uses the carton's real-time position (z=0.779), so the gripper at z=1.14 is way outside the Follow AABB (z range [0.679, 0.879]).**
-
-Trajectory proof — GRASP d_world is measured from STALE target, not real carton:
-```
-Step 210: eef_real=[0.309,0.672,1.144] tgt=[0.328,0.687,1.117] d_world=0.037 ← close to STALE target
-                                       carton_actual=[0.302,0.700,0.779]       ← real carton 0.37m below!
-```
+1. **Real-time carton position tracking**: `[Policy] Carton pos updated: [0.328,0.687,1.074] → [0.302,0.700,0.779] (diff=0.296m)` — BUG 13 FIXED!
+2. **Follow = 1.0 for all 4 yellow carton episodes!** Gripper enters AABB at step 180 (z=0.860)
+3. **Arm converges initially**: d_world 0.480 → 0.234 → 0.115 → 0.105 in APPROACH
+4. **bj5 computation correct**: yellow=1.431, black=1.199
 
 ---
 
-## BUG 14: ARM_BASE_RPY offset may be incorrect
+## BUG 15 [CRITICAL]: Coordinate Frame Mismatch — arm stalls at ~0.12m from target
 
-The code applies ARM_BASE_RPY (-π/2 around x) to the queried arm_base_link rotation. But the queried prim pose ALREADY includes the link's full orientation. IKFKSolver's arm_base frame may or may not include this RPY offset — we need to test both.
+### Evidence
 
-The arm converges but overshoots (d_world: 0.037 → 0.074 → 0.134 → 0.240), which could be caused by the RPY offset introducing a directional bias. However, the stale target position (BUG 13) is the primary issue — fix that first.
+Yellow carton GRASP trajectory (carton at [0.302, 0.700, 0.779]):
+```
+Step 150: eef=[0.201, 0.760, 0.905]  d=0.159  ← converging
+Step 180: eef=[0.198, 0.752, 0.860]  d=0.131  ← Follow triggers here!
+Step 210: eef=[0.196, 0.746, 0.836]  d=0.121  
+Step 240: eef=[0.195, 0.744, 0.827]  d=0.119  ← stalling
+Step 270: eef=[0.195, 0.744, 0.825]  d=0.119  ← STUCK
+Step 420: eef=[0.193, 0.745, 0.825]  d=0.121  ← STILL STUCK
+Step 432: Gripper closes at real_dist=0.126 (sub_step > 300 timeout)
+```
+
+Stall point [0.193, 0.745, 0.825] vs target [0.302, 0.700, 0.799]:
+- **x error: 0.109m** (systematic, same for black carton: 0.504-0.393=0.111m)
+- y error: 0.045m
+- z error: 0.026m
+
+Black carton APPROACH trajectory (carton at [0.504, 0.757, 0.779]):
+```
+Step  60: eef=[0.553, 0.568, 1.150]  d=0.295  ← moving correctly
+Step  90: eef=[0.493, 0.658, 1.071]  d=0.173  ← moving, x passed target
+Step 120: eef=[0.441, 0.727, 1.003]  d=0.102  ← x overshoots (0.441 < 0.504)
+Step 150: eef=[0.409, 0.755, 0.969]  d=0.103  ← DIVERGING
+Step 210: eef=[0.394, 0.761, 0.959]  d=0.114  ← STUCK
+Step 240+: eef=[0.393, 0.761, 0.959]  d=0.114  ← FROZEN for 300 steps
+```
+
+### Root Cause: `target_local` and `obs["r_eef_pos"]` are in different frames
+
+The function `_move_right_toward(target_l, obs["r_eef_pos"], ...)` computes:
+```python
+error = target_l - obs["r_eef_pos"]
+```
+
+But these are in **different coordinate frames**:
+- `target_l` = `_corrected_world_to_arm(target_w, obs)` transforms through **real arm_base prim** (at [0.137, 0.093, 1.145])
+- `obs["r_eef_pos"]` = IKFKSolver FK output, relative to **body FK arm_base** (at [0.565, 0.233, 1.060])
+
+The body FK arm_base is **0.428m off in x, 0.140m off in y** from the real prim position. When these positions are subtracted, the resulting error vector doesn't represent the true displacement needed.
+
+The arm initially moves in the right direction (because the error direction is approximately correct at large distances), but converges to the wrong position (because the absolute frame offset dominates at small distances). The ~0.11m systematic x-axis error is a direct consequence of this frame mismatch.
+
+### Fix: Use relative error transform (rotation only)
+
+Instead of transforming the absolute world target through T_inv (which produces coordinates in the real arm_base frame, incompatible with `obs["r_eef_pos"]`), compute the world-frame displacement from the real gripper to the target, rotate it to the arm_base local frame, and add it to `obs["r_eef_pos"]`:
+
+```python
+world_error = target_world - real_gripper_world     # vector in world frame
+local_error = R_arm_base_inv @ world_error           # rotate to local frame
+target_solver = obs["r_eef_pos"] + local_error       # target in solver's frame
+```
+
+This works because:
+- `obs["r_eef_pos"]` is the current EEF in the solver's arm_base frame ✓
+- `local_error` is the world displacement rotated to match the local frame orientation ✓
+- The rotation from the real arm_base prim IS correct (same physical frame) ✓
+- Only the position was wrong (body FK error), and we avoid using it ✓
 
 ---
 
 ## Implementation Plan
 
-### File 1: `scripts/run_sorting_benchmark.py`
+### File: `scripts/scripted_sorting_policy.py`
 
-#### Change 1A: Re-query carton position in `_patched_step` every step
+#### Change 1: New method `_world_target_to_solver_frame()`
 
-The carton's real-time world position must be tracked, just like the gripper position. Add carton position tracking to `_patched_step`.
-
-In the `_patched_step` closure variables (near `_diag_carton_name = target_carton_name`), add the carton prim path:
+Add this method right after `_corrected_arm_to_world` (around line 248):
 
 ```python
-_diag_carton_name = target_carton_name
-_carton_prim_path = None
-if target_carton_name:
-    _carton_prim_path = f"/Workspace/Objects/{target_carton_name}"
-```
+def _world_target_to_solver_frame(
+    self, target_world: np.ndarray, obs: dict,
+) -> np.ndarray:
+    """Convert world target to IKFKSolver's local frame.
 
-In `_patched_step`, after the gripper query, add carton position query:
-
-```python
-# Query real carton position EVERY step
-if _carton_prim_path:
-    try:
-        cp, _ = _env.api_core.get_obj_world_pose(_carton_prim_path)
-        _shared_state["real_carton_world"] = [
-            float(cp[0]), float(cp[1]), float(cp[2])
-        ]
-    except Exception:
-        pass
-```
-
-#### Change 1B: Fix zero-quaternion guard in arm_base candidates
-
-The current candidate list starts with `/genie/arm_r_base_link` which returns a zero quaternion. Fix:
-
-```python
-for cand in [
-    "/genie/arm_base_link",       # correct prim name (from enum)
-    "/genie/arm_r_base_link",
-    "/genie/arm_r_link1",
-]:
-    try:
-        ab_p, ab_r = _env.api_core.get_obj_world_pose(cand)
-        # Skip zero quaternions (invalid prim)
-        import math
-        qnorm = math.sqrt(sum(
-            float(ab_r[i]) ** 2 for i in range(4)
-        ))
-        if qnorm < 0.01:
-            print(f"[ArmBase] {cand}: zero quat, skip")
-            continue
-        # ... rest of existing code
-```
-
-(This was already hotfixed locally but needs to be committed.)
-
-### File 2: `scripts/scripted_sorting_policy.py`
-
-#### Change 2A: Use real-time carton position from shared state
-
-In `act()`, before dispatching to phase handlers, update `_carton_pos` from shared state:
-
-```python
-# Update carton position from real-time simulation query
-if (self._shared_state is not None
-        and self._shared_state.get("real_carton_world")):
-    new_pos = np.array(self._shared_state["real_carton_world"])
-    if self._carton_pos is not None:
-        # Only update if significantly different (carton has settled)
-        diff = np.linalg.norm(new_pos - self._carton_pos)
-        if diff > 0.01:
-            if self.step_count <= 5:
-                print(f"[Policy] Carton pos updated: "
-                      f"{self._carton_pos} → {new_pos} "
-                      f"(diff={diff:.3f}m)")
-            self._carton_pos = new_pos
-    else:
-        self._carton_pos = new_pos
-```
-
-Place this BEFORE the fallback positions block and BEFORE the phase handler dispatch.
-
-#### Change 2B: Add zero-quaternion guard in `_get_real_arm_base_T`
-
-```python
-pos = np.array(ab_pos)
-qw, qx, qy, qz = ab_rot
-# Guard against zero quaternion
-qnorm = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
-if qnorm < 0.01:
-    return None
-```
-
-(Also hotfixed locally, needs committing.)
-
-#### Change 2C: Try WITHOUT ARM_BASE_RPY offset
-
-The queried `/genie/arm_base_link` world pose already includes the link orientation. The RPY offset may not be needed. **Comment out the RPY rotation** to test:
-
-```python
-def _get_real_arm_base_T(self) -> np.ndarray | None:
-    # ... existing code ...
-    if R is not None:
-        rot_mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
-    else:
-        rot_mat = np.eye(3)
-
-    # NOTE: Do NOT apply ARM_BASE_RPY — the queried prim pose
-    # already includes the link's full orientation. Applying
-    # an extra -pi/2 rotation causes directional errors.
-    # rpy_rot = self._rot('x', self.ARM_BASE_RPY[0])
-    # rot_mat = rot_mat @ rpy_rot
-
-    T = np.eye(4)
-    T[:3, :3] = rot_mat
-    T[:3, 3] = pos
-    return T
-```
-
-**If results get WORSE** (arm moves in completely wrong direction), then the RPY IS needed. In that case, restore it. But the overshoot pattern suggests it should be removed.
-
-#### Change 2D: Fix GRASP gripper close timing — use real-time distance
-
-Currently GRASP closes the gripper when FK-computed d < 0.03 or sub_step > 300. With real-time carton position, use world-frame distance:
-
-```python
-def _phase_grasp(self, obs):
-    bj5_hold = obs["bj5"]
-
-    # Get real-time distance to carton
+    Uses relative error: computes world displacement from real gripper
+    to target, rotates to local frame, adds to solver's EEF position.
+    This avoids the body-FK origin mismatch.
+    """
+    # Get real gripper world position
     real_grip = None
     if (self._shared_state is not None
             and self._shared_state.get("real_gripper_world")):
         real_grip = np.array(self._shared_state["real_gripper_world"])
-    if real_grip is not None:
-        real_dist = np.linalg.norm(real_grip - self._carton_pos)
-    else:
-        real_dist = float('inf')
 
-    # Sub 1: lower to carton
-    if self.right_grip < 0.5:
-        target_w = self._carton_pos.copy()
-        target_w[2] += self.GRASP_HEIGHT
-        target_l = self._corrected_world_to_arm(target_w, obs)
-        new_joints, dist = self._move_right_toward(
-            target_l, obs["r_eef_pos"], obs["r_eef_quat"],
-            obs["arm_14"], step_size=self.EEF_STEP_SLOW,
-        )
-        action = self._build_action(obs["left_arm"], new_joints, bj5_hold)
-        self._log(obs, target_w, "lowering")
+    T = self._get_real_arm_base_T()
 
-        # Close gripper when real distance is small enough
-        if real_dist < 0.06 or dist < 0.03 or self.sub_step > 300:
-            self.right_grip = 1.0
-            self.sub_step = 0
-            print(f"[Policy] Gripper closing at step {self.step_count}"
-                  f" real_dist={real_dist:.3f}")
-        return action
+    if real_grip is not None and T is not None:
+        # World-frame error vector
+        world_error = target_world - real_grip
+        # Rotate to arm_base local frame (T[:3,:3] maps local→world,
+        # so its transpose maps world→local)
+        R_inv = T[:3, :3].T
+        local_error = R_inv @ world_error
+        # Add to current solver EEF position
+        return np.array(obs["r_eef_pos"]) + local_error
 
-    # ... rest of existing code unchanged ...
+    # Fallback to old method
+    return self._corrected_world_to_arm(target_world, obs)
+```
+
+#### Change 2: Update `_phase_approach` — use new method
+
+Replace line 624:
+```python
+target_l = self._corrected_world_to_arm(target_w, obs)
+```
+With:
+```python
+target_l = self._world_target_to_solver_frame(target_w, obs)
+```
+
+#### Change 3: Update `_phase_grasp` — use new method in all 3 sub-phases
+
+Replace line 658 (lowering):
+```python
+target_l = self._corrected_world_to_arm(target_w, obs)
+```
+With:
+```python
+target_l = self._world_target_to_solver_frame(target_w, obs)
+```
+
+Replace line 683 (lifting):
+```python
+target_l = self._corrected_world_to_arm(target_w, obs)
+```
+With:
+```python
+target_l = self._world_target_to_solver_frame(target_w, obs)
+```
+
+#### Change 4: Update `_phase_move_to_scanner` — use new method
+
+Find all `_corrected_world_to_arm` calls in `_phase_move_to_scanner` and replace with `_world_target_to_solver_frame`.
+
+#### Change 5: Update all remaining phases (`_phase_regrasp`, `_phase_move_to_bin`)
+
+Find ALL remaining calls to `_corrected_world_to_arm` in phase handlers and replace with `_world_target_to_solver_frame`. The `_corrected_world_to_arm` method itself should be kept (not deleted) as a fallback inside the new method.
+
+#### Change 6: Reduce APPROACH→GRASP transition threshold
+
+Currently APPROACH transitions to GRASP after `sub_step > 500` (or `dist < 0.04`). With the frame fix, `dist` should decrease properly. Change:
+
+```python
+# In _phase_approach, line 632:
+if dist < 0.04 or self.sub_step > 500:
+```
+To:
+```python
+if dist < 0.03 or self.sub_step > 300:
+```
+
+Also, the "holding near carton" branch (line 607-616) uses `world_dist < 0.2`. With the frame fix, the arm should move closer. Change:
+```python
+if world_dist < 0.2:
+```
+To:
+```python
+if world_dist < 0.10:
+```
+This prevents premature holding when the arm is still 0.15m away.
+
+#### Change 7: Reduce gripper close distance threshold
+
+Currently gripper closes at `real_dist < 0.06`. With the frame fix, the arm should get much closer. Add a diagnostic print when close:
+
+```python
+# In _phase_grasp, line 667:
+if real_dist < 0.06 or dist < 0.03 or self.sub_step > 300:
+```
+To:
+```python
+if real_dist < 0.05 or dist < 0.02 or self.sub_step > 400:
+    # Give more time for arm to converge, close at tighter distance
 ```
 
 ---
 
 ## Expected Behavior After Fix
 
-1. At step 1, `_carton_pos` updates from [0.328, 0.687, 1.097] to [0.302, 0.700, 0.779]
-2. APPROACH: gripper at [0.453, 0.600, 1.213], carton at z≈0.779
-   - d_world = √((0.453-0.302)² + (0.600-0.700)² + (1.213-0.779)²) ≈ 0.46m
-   - NOT within 0.2m, so arm will try to MOVE instead of holding
-3. Arm moves toward [0.302, 0.700, 0.779+0.15] = [0.302, 0.700, 0.929]
-4. As arm descends, gripper enters carton AABB → Follow triggers!
-5. GRASP: gripper closes when real_dist < 0.06
+1. **APPROACH**: arm_base local error correctly computed, arm converges in both x and y
+   - Yellow carton: d_world should reach < 0.05m (vs 0.105m before)
+   - Black carton: d_world should decrease steadily (vs FROZEN at 0.114m before)
+
+2. **GRASP**: arm descends to within 0.05m of carton (vs stalling at 0.12m)
+   - Gripper closes at real_dist < 0.05m (vs timeout at 0.126m)
+   - PickUpOnGripper should trigger if carton is actually gripped
+
+3. **Follow for black carton**: gripper should enter AABB (z range [0.679, 0.879])
+   - Currently stuck at z=0.959, needs to descend to z < 0.879
 
 ---
 
 ## Verification Checklist
 
-- [ ] `[Policy] Carton pos updated: [old] → [new]` appears at step 1
-- [ ] GRASP d_world measured against actual carton position (z≈0.78)
-- [ ] Gripper enters carton AABB (z within [0.679, 0.879])
-- [ ] Follow score > 0 for at least one episode
-- [ ] `[ArmBase] FOUND: /genie/arm_base_link` (not arm_r_base_link)
+- [ ] Yellow carton: d_world during GRASP < 0.05m (was 0.119m)
+- [ ] Yellow carton: PickUpOnGripper = 1 for at least 1 episode
+- [ ] Black carton: Follow = 1 (gripper enters AABB)
+- [ ] Black carton: arm not frozen during APPROACH
+- [ ] No `[IK] Poor convergence` messages (ik_err < 0.12)
+- [ ] `_world_target_to_solver_frame` used in all phase handlers
 
 ---
 
 ## Priority
 
-1. **Change 1A + 2A**: Real-time carton position (fixes BUG 13 — the main reason Follow fails)
-2. **Change 1B + 2B**: Zero-quaternion guard (prevents crash)
-3. **Change 2C**: Remove ARM_BASE_RPY offset (fixes arm overshoot)
-4. **Change 2D**: GRASP close timing with real-time distance
-
----
-
-## Hotfixes Already Applied Locally (need committing)
-
-The following changes were made locally to fix the zero-quaternion crash:
-1. `run_sorting_benchmark.py`: Reordered arm_base candidates, added qnorm check
-2. `scripted_sorting_policy.py`: Added qnorm < 0.01 guard in `_get_real_arm_base_T`
-
-These should be committed along with the new changes above.
+1. **Changes 1–5**: Frame fix (fixes BUG 15 — the main reason arm stalls and PickUp fails)
+2. **Change 6**: Tighter APPROACH threshold (prevents premature holding)
+3. **Change 7**: Tighter gripper close distance
