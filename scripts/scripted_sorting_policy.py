@@ -277,6 +277,24 @@ class ScriptedSortingPolicy(BasePolicy):
 
         return self._corrected_world_to_arm(target_world, obs)
 
+    def _world_down_target_rpy(
+        self, world_yaw: float | None = None,
+    ) -> np.ndarray | None:
+        """Compute local target_rpy that points gripper down in world frame.
+
+        Used during placement to keep carton level regardless of body lean.
+        """
+        T = self._get_real_arm_base_T()
+        if T is None or R is None:
+            return None
+        R_aw = T[:3, :3]
+        if world_yaw is None:
+            world_yaw = 0.0
+        # Desired world rotation: gripper z-axis points down (-z world)
+        R_gw = R.from_euler('xyz', [np.pi, 0.0, world_yaw]).as_matrix()
+        R_local = R_aw.T @ R_gw
+        return R.from_matrix(R_local).as_euler('xyz')
+
     # ── bj5 computation ──────────────────────────────────────────────
 
     def _compute_bj5_for_target(self, target_world: np.ndarray) -> float:
@@ -441,10 +459,12 @@ class ScriptedSortingPolicy(BasePolicy):
         self.phase = name
         self.sub_step = 0
         # Body lean control via shared state
+        # Keep lean active for MOVE_TO_BIN too (BUG 25: bin out of reach)
         if self._shared_state is not None:
-            if name in ("APPROACH", "GRASP", "MOVE_TO_SCANNER", "REGRASP"):
+            if name in ("APPROACH", "GRASP", "MOVE_TO_SCANNER",
+                        "REGRASP", "MOVE_TO_BIN"):
                 self._shared_state["desired_bj2"] = self.BJ2_LEAN
-            elif name in ("MOVE_TO_BIN", "RETURN", "DONE"):
+            elif name in ("RETURN", "DONE"):
                 self._shared_state["desired_bj2"] = self.BJ2_INIT
 
     # ── Debug logging ────────────────────────────────────────────────
@@ -745,13 +765,19 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, self._scanner_pos, "rotating_to_scanner")
             return action
 
-        # Sub 2: move above scanner
+        # Compute world-down target_rpy to keep carton level (BUG 24 fix)
+        # The body lean (bj2=BJ2_LEAN) tilts the gripper relative to world.
+        # Force world-down orientation during placement.
+        down_rpy = self._world_down_target_rpy(world_yaw=self._bj5_scanner)
+
+        # Sub 2: move above scanner with world-down gripper
         target_w = self._scanner_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist_above = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
+            target_rpy=down_rpy,
         )
 
         if dist_above > 0.05 and self.sub_step < 280:
@@ -768,6 +794,7 @@ class ScriptedSortingPolicy(BasePolicy):
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
+            target_rpy=down_rpy,
         )
 
         if dist > 0.02 and self.sub_step < 380:
@@ -898,32 +925,60 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, self._bin_pos, "rotating_to_bin")
             return action
 
-        # Sub 2: extend arm toward bin (may not fully reach, that's OK)
+        # Compute world-down rpy for proper drop orientation (BUG 24)
+        down_rpy = self._world_down_target_rpy(world_yaw=self._bj5_bin)
+
+        # Sub 2: extend arm toward bin (push as far as possible)
+        # Increased reach from 0.65 → 0.75 for BUG 25 (bin out of reach)
         arm_w_real = self._corrected_arm_to_world(np.zeros(3), obs)
         to_bin = self._bin_pos - arm_w_real
         to_bin_dir = to_bin / (np.linalg.norm(to_bin) + 1e-8)
-        reach_w = arm_w_real + to_bin_dir * 0.65
-        reach_w[2] = max(self._bin_pos[2] + 0.15, reach_w[2])
+        reach_w = arm_w_real + to_bin_dir * 0.75
+        # Hold gripper above bin top for clean drop
+        reach_w[2] = max(self._bin_pos[2] + 0.10, reach_w[2])
         target_l = self._world_target_to_solver_frame(reach_w, obs)
 
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
+            target_rpy=down_rpy,
         )
 
-        if dist > 0.06 and self.sub_step < 250:
+        # Check real gripper-to-bin distance
+        real_grip = None
+        if (self._shared_state is not None
+                and self._shared_state.get("real_gripper_world")):
+            real_grip = np.array(self._shared_state["real_gripper_world"])
+        bin_xy_dist = (
+            np.linalg.norm(real_grip[:2] - self._bin_pos[:2])
+            if real_grip is not None else float('inf')
+        )
+
+        # Extend until either close to target or close to bin xy (BUG 26)
+        if (dist > 0.05 and bin_xy_dist > 0.20
+                and self.sub_step < 300):
             action = self._build_action(
                 obs["left_arm"], new_joints, self._bj5_bin, grip=1.0,
             )
             self._log(obs, reach_w, "extending_to_bin")
             return action
 
-        # Sub 3: release
+        # Sub 3: release — only when gripper is over bin (xy < 0.20m)
+        # or when timeout exceeded
+        if bin_xy_dist > 0.30 and self.sub_step < 350:
+            # Still too far — keep extending
+            action = self._build_action(
+                obs["left_arm"], new_joints, self._bj5_bin, grip=1.0,
+            )
+            self._log(obs, reach_w, "extending_more")
+            return action
+
         self.right_grip = 0.0
         action = self._build_action(
             obs["left_arm"], self.last_right_arm, self._bj5_bin, grip=0.0,
         )
-        if self.sub_step > 250 + self.RELEASE_HOLD_STEPS:
+        self._log(obs, self._bin_pos, "releasing_into_bin")
+        if self.sub_step > 350 + self.RELEASE_HOLD_STEPS:
             self._set_phase("RETURN")
         return action
 
