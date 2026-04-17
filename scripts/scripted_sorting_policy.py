@@ -79,7 +79,7 @@ class ScriptedSortingPolicy(BasePolicy):
     LIFT_HEIGHT = 0.30        # m above target after grasping
     GRASP_HOLD_STEPS = 35     # steps to hold gripper closed
     RELEASE_HOLD_STEPS = 30   # steps to hold gripper open
-    SCANNER_PLACE_HEIGHT = 0.06  # m above scanner center for release
+    SCANNER_PLACE_HEIGHT = 0.02  # m above scanner center for release
 
     # ── Body lean for extended reach ─────────────────────────────────
     BJ2_INIT = 1.344          # initial bj2 value (from body_state)
@@ -158,6 +158,7 @@ class ScriptedSortingPolicy(BasePolicy):
         self._init_eef_rpy = None
         self._runtime_carton_positions = {}
         self._logged_init = False
+        self._gripper_carton_offset = np.zeros(3)
 
     # ── Rotation / FK helpers ────────────────────────────────────────
 
@@ -697,6 +698,10 @@ class ScriptedSortingPolicy(BasePolicy):
     def _phase_grasp(self, obs: dict) -> np.ndarray:
         bj5_hold = obs["bj5"]  # keep current waist angle
 
+        # BUG 30A: world-down gripper orientation during GRASP
+        # Use current bj5 as world yaw so IK stays feasible
+        down_rpy = self._world_down_target_rpy(world_yaw=float(obs["bj5"]))
+
         # Get real-time distance to carton
         real_grip = None
         if (self._shared_state is not None
@@ -707,7 +712,7 @@ class ScriptedSortingPolicy(BasePolicy):
         else:
             real_dist = float('inf')
 
-        # Sub 1: lower to carton
+        # Sub 1: lower to carton (with world-down rpy for vertical grasp)
         if self.right_grip < 0.5:
             target_w = self._carton_pos.copy()
             target_w[2] += self.GRASP_HEIGHT
@@ -715,6 +720,7 @@ class ScriptedSortingPolicy(BasePolicy):
             new_joints, dist = self._move_right_toward(
                 target_l, obs["r_eef_pos"], obs["r_eef_quat"],
                 obs["arm_14"], step_size=self.EEF_STEP_SLOW,
+                target_rpy=down_rpy,
             )
             action = self._build_action(obs["left_arm"], new_joints, bj5_hold)
             self._log(obs, target_w, "lowering")
@@ -733,13 +739,14 @@ class ScriptedSortingPolicy(BasePolicy):
                 obs["left_arm"], self.last_right_arm, bj5_hold, grip=1.0,
             )
 
-        # Sub 3: lift carton
+        # Sub 3: lift carton (maintain world-down orientation)
         target_w = self._carton_pos.copy()
         target_w[2] += self.LIFT_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
+            target_rpy=down_rpy,
         )
         action = self._build_action(obs["left_arm"], new_joints, bj5_hold, grip=1.0)
         self._log(obs, target_w, "lifting")
@@ -758,6 +765,25 @@ class ScriptedSortingPolicy(BasePolicy):
                 print(f"[Diag] GRASP-end gripper world_rpy="
                       f"[{world_rpy[0]:.3f},{world_rpy[1]:.3f},"
                       f"{world_rpy[2]:.3f}]")
+
+            # BUG 32A: capture gripper-carton offset for placement compensation
+            real_grip_arr = (
+                np.array(self._shared_state.get("real_gripper_world"))
+                if self._shared_state
+                and self._shared_state.get("real_gripper_world")
+                else None
+            )
+            real_carton_arr = (
+                np.array(self._shared_state.get("real_carton_world"))
+                if self._shared_state
+                and self._shared_state.get("real_carton_world")
+                else None
+            )
+            if real_grip_arr is not None and real_carton_arr is not None:
+                self._gripper_carton_offset = real_carton_arr - real_grip_arr
+                print(f"[Diag] gripper_carton_offset="
+                      f"{self._gripper_carton_offset}")
+
             self._set_phase("MOVE_TO_SCANNER")
         return action
 
@@ -779,7 +805,10 @@ class ScriptedSortingPolicy(BasePolicy):
             return action
 
         # Sub 2: move above scanner
+        # BUG 32A: subtract gripper-carton offset so CARTON lands at scanner xy
         target_w = self._scanner_pos.copy()
+        target_w[0] -= self._gripper_carton_offset[0]
+        target_w[1] -= self._gripper_carton_offset[1]
         target_w[2] += self.APPROACH_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist_above = self._move_right_toward(
@@ -804,7 +833,10 @@ class ScriptedSortingPolicy(BasePolicy):
             return action
 
         # Sub 3: lower to scanner release height (NOT all the way down)
+        # BUG 32A: subtract gripper-carton offset for centered placement
         target_w = self._scanner_pos.copy()
+        target_w[0] -= self._gripper_carton_offset[0]
+        target_w[1] -= self._gripper_carton_offset[1]
         target_w[2] += self.SCANNER_PLACE_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
