@@ -744,7 +744,20 @@ class ScriptedSortingPolicy(BasePolicy):
         action = self._build_action(obs["left_arm"], new_joints, bj5_hold, grip=1.0)
         self._log(obs, target_w, "lifting")
 
+        # Diagnostic (BUG 29A): log gripper RPY at GRASP transition
         if dist < 0.04 or self.sub_step > self.GRASP_HOLD_STEPS + 200:
+            rpy = self._get_eef_rpy(obs["r_eef_quat"])
+            print(f"[Diag] GRASP-end gripper local_rpy="
+                  f"[{rpy[0]:.3f},{rpy[1]:.3f},{rpy[2]:.3f}]")
+            T_real = self._get_real_arm_base_T()
+            if T_real is not None and R is not None:
+                qw, qx, qy, qz = obs["r_eef_quat"]
+                R_local = R.from_quat([qx, qy, qz, qw]).as_matrix()
+                R_world = T_real[:3, :3] @ R_local
+                world_rpy = R.from_matrix(R_world).as_euler('xyz')
+                print(f"[Diag] GRASP-end gripper world_rpy="
+                      f"[{world_rpy[0]:.3f},{world_rpy[1]:.3f},"
+                      f"{world_rpy[2]:.3f}]")
             self._set_phase("MOVE_TO_SCANNER")
         return action
 
@@ -765,19 +778,13 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, self._scanner_pos, "rotating_to_scanner")
             return action
 
-        # Compute world-down target_rpy to keep carton level (BUG 24 fix)
-        # The body lean (bj2=BJ2_LEAN) tilts the gripper relative to world.
-        # Force world-down orientation during placement.
-        down_rpy = self._world_down_target_rpy(world_yaw=self._bj5_scanner)
-
-        # Sub 2: move above scanner with world-down gripper
+        # Sub 2: move above scanner
         target_w = self._scanner_pos.copy()
         target_w[2] += self.APPROACH_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist_above = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
-            target_rpy=down_rpy,
         )
 
         if dist_above > 0.05 and self.sub_step < 280:
@@ -787,6 +794,15 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, target_w, "above_scanner")
             return action
 
+        # Stabilization hold: pause briefly after reaching above_scanner
+        # to let xy settle before vertical descent (BUG 28A)
+        if self.sub_step < 320:
+            action = self._build_action(
+                obs["left_arm"], self.last_right_arm, self._bj5_scanner, grip=1.0,
+            )
+            self._log(obs, target_w, "stabilize_above")
+            return action
+
         # Sub 3: lower to scanner release height (NOT all the way down)
         target_w = self._scanner_pos.copy()
         target_w[2] += self.SCANNER_PLACE_HEIGHT
@@ -794,7 +810,6 @@ class ScriptedSortingPolicy(BasePolicy):
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
-            target_rpy=down_rpy,
         )
 
         if dist > 0.02 and self.sub_step < 380:
@@ -805,11 +820,29 @@ class ScriptedSortingPolicy(BasePolicy):
             return action
 
         # Sub 4: release
+        if self.sub_step == 381:
+            # Diagnostic (BUG 28): log eef + carton at release moment
+            real_grip = (
+                self._shared_state.get("real_gripper_world")
+                if self._shared_state else None
+            )
+            real_carton = (
+                self._shared_state.get("real_carton_world")
+                if self._shared_state else None
+            )
+            print(f"[Diag] SCANNER release: eef_world={real_grip} "
+                  f"carton_world={real_carton}")
         self.right_grip = 0.0
         action = self._build_action(
             obs["left_arm"], self.last_right_arm, self._bj5_scanner, grip=0.0,
         )
         if self.sub_step > 380 + self.RELEASE_HOLD_STEPS:
+            # Diagnostic: log final settled carton
+            real_carton = (
+                self._shared_state.get("real_carton_world")
+                if self._shared_state else None
+            )
+            print(f"[Diag] SCANNER settled: carton_world={real_carton}")
             self._set_phase("REGRASP")
         return action
 
@@ -925,9 +958,6 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, self._bin_pos, "rotating_to_bin")
             return action
 
-        # Compute world-down rpy for proper drop orientation (BUG 24)
-        down_rpy = self._world_down_target_rpy(world_yaw=self._bj5_bin)
-
         # Sub 2: extend arm toward bin (push as far as possible)
         # Increased reach from 0.65 → 0.75 for BUG 25 (bin out of reach)
         arm_w_real = self._corrected_arm_to_world(np.zeros(3), obs)
@@ -941,7 +971,6 @@ class ScriptedSortingPolicy(BasePolicy):
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_FAST,
-            target_rpy=down_rpy,
         )
 
         # Check real gripper-to-bin distance
