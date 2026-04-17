@@ -39,7 +39,7 @@ default_args = {
     "benchmark.policy_class": "ScriptedPolicy",
     "benchmark.num_episode": "1",
     "benchmark.enable_ros": "false",
-    "app.headless": "false",          # default to graphical for local
+    "app.headless": "true",           # headless mode for Docker/benchmark
     "app.enable_ros": "false",
 }
 for key, value in default_args.items():
@@ -662,6 +662,24 @@ class TaskBenchmarkPatcher(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                                       f"{lp[2]:.4f}]")
                             except Exception:
                                 pass
+
+                            # Query scanner prim geometry
+                            for scanner_path in [
+                                "/Workspace/Objects/scanning_table",
+                                "/Workspace/Objects/scanner",
+                                "/Workspace/Objects/barcode_scanner",
+                                "/World/background/benchmark_scanner_000",
+                            ]:
+                                try:
+                                    sp, sr = _env.api_core.get_obj_world_pose(
+                                        scanner_path
+                                    )
+                                    print(f"[Scanner] {scanner_path}: "
+                                          f"pos=[{sp[0]:.4f},{sp[1]:.4f},"
+                                          f"{sp[2]:.4f}]")
+                                    break
+                                except Exception:
+                                    continue
 
                         # Diagnostic logging every 30 steps
                         if _step_counter[0] % 30 == 1:

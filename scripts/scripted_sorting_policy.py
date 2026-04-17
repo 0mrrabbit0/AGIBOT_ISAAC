@@ -79,6 +79,7 @@ class ScriptedSortingPolicy(BasePolicy):
     LIFT_HEIGHT = 0.30        # m above target after grasping
     GRASP_HOLD_STEPS = 35     # steps to hold gripper closed
     RELEASE_HOLD_STEPS = 30   # steps to hold gripper open
+    SCANNER_PLACE_HEIGHT = 0.06  # m above scanner center for release
 
     # ── Body lean for extended reach ─────────────────────────────────
     BJ2_INIT = 1.344          # initial bj2 value (from body_state)
@@ -760,16 +761,16 @@ class ScriptedSortingPolicy(BasePolicy):
             self._log(obs, target_w, "above_scanner")
             return action
 
-        # Sub 3: lower onto scanner
+        # Sub 3: lower to scanner release height (NOT all the way down)
         target_w = self._scanner_pos.copy()
-        target_w[2] += self.GRASP_HEIGHT
+        target_w[2] += self.SCANNER_PLACE_HEIGHT
         target_l = self._world_target_to_solver_frame(target_w, obs)
         new_joints, dist = self._move_right_toward(
             target_l, obs["r_eef_pos"], obs["r_eef_quat"],
             obs["arm_14"], step_size=self.EEF_STEP_SLOW,
         )
 
-        if dist > 0.03 and self.sub_step < 380:
+        if dist > 0.02 and self.sub_step < 380:
             action = self._build_action(
                 obs["left_arm"], new_joints, self._bj5_scanner, grip=1.0,
             )
