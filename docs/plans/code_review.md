@@ -1,4 +1,4 @@
-# Code Review & Modification Suggestions (Round 14)
+# Code Review & Modification Suggestions (Round 15)
 
 **Date**: 2026-04-17
 **Reviewer**: Local Claude Code (Evaluation)
@@ -6,218 +6,214 @@
 
 ---
 
-## Round 13 Result: MASSIVE PROGRESS — Score 0.5417 (vs Round 8 0.0833)
+## Round 14 Result: REGRESSION — Score 0.5000 (vs Round 13's 0.5417)
 
-Commit `2a58d70` (Round 13 fixes: scanner place height + headless default).
+Commit `8a8cb8c` (Round 14 fixes: world-down gripper + extended bin reach).
 
-### Score Breakdown (8 episodes, 6 sub-tasks each)
+### Score Breakdown
 
-| Sub-task | Yellow (Ep1-4) | Black (Ep5-8) | Total |
-|---|---|---|---|
-| Follow | 1.0,1.0,1.0,1.0 | 1.0,1.0,1.0,1.0 | **8/8** ✅ |
-| PickUpOnGripper (grasp) | 1,1,1,1 | 1,1,1,1 | **8/8** ✅ |
-| Inside (scanner) | 1,1,1,1 | 1,1,1,1 | **8/8** ✅ |
-| Upright | 0,0,0,**1** | 0,0,0,0 | 1/8 ❌ |
-| PickUpOnGripper (regrasp) | 0,0,0,**1** | 0,0,0,0 | 1/8 ❌ |
-| Inside (bin) | 0,0,0,0 | 0,0,0,0 | **0/8** ❌ |
+| Sub-task | Yellow (Ep1-4) | Black (Ep5-8) | Total | Δ Round 13 |
+|---|---|---|---|---|
+| Follow | 1,1,1,1 | 1,1,1,1 | **8/8** ✅ | = |
+| PickUpOnGripper (grasp) | 1,1,1,1 | 1,1,1,1 | **8/8** ✅ | = |
+| Inside (scanner) | 1,1,1,1 | 1,1,1,1 | **8/8** ✅ | = |
+| Upright | 0,0,0,0 | 0,0,0,0 | **0/8** ❌ | **−1** |
+| PickUpOnGripper (regrasp) | 0,0,0,0 | 0,0,0,0 | **0/8** ❌ | **−1** |
+| Inside (bin) | 0,0,0,0 | 0,0,0,0 | 0/8 ❌ | = |
 
-**Average**: 0.5417 — **6.5x improvement** over Round 8 (0.0833), **+0.04 over Round 12 (0.5000)**
+**Average**: 0.5000 — **regressed −0.04** from Round 13.
 
-### What Works (massive wins from Rounds 9-13)
-
-1. ✅ **Follow** — gripper follows target carton in AABB for ALL 8 episodes
-2. ✅ **PickUpOnGripper** — successful grasp on first attempt for ALL 8
-3. ✅ **Inside (scanner)** — carton placed inside scanner zone for ALL 8
-4. ✅ Episode 4: full chain through REGRASP_PickUp succeeds (5/6 sub-tasks)
+The world-down RPY change destroyed Episode 4's lucky Upright success without
+helping any other episode. **The fix made things worse.**
 
 ---
 
-## BUG 24 [HIGH]: Carton not Upright on scanner (7/8 fail)
+## BUG 27 [CRITICAL]: world-down RPY override moves arm in WRONG direction
 
-**Symptom**: After placing carton on scanner, the Upright check fails with `evt: 4` (timeout).
-Only Episode 4 (yellow, by luck) achieves Upright with `dot product: 1.000, angle: 0.06°`.
+**Symptom**: With `_world_down_target_rpy` applied during MOVE_TO_SCANNER, the
+arm overshoots the scanner in the -y direction.
 
-**Evidence — Episode 4 SUCCESS log**:
-```
-Step 5377: [Upright] Object is upright: dot=1.000 (min: 0.996), angle: 0.06° (threshold: 5.00°)
-```
+**Trajectory comparison**:
 
-**Evidence — Episode 1 FAILURE log**:
+Round 13 (works, no world-down):
 ```
-Step 1410: Action [Inside] evt: 3       ← carton enters scanner zone
-Step 2107: Action [Upright] evt: 4      ← Upright TIMED OUT (never reached <5° tilt)
+MOVE_TO_SCANNER:480 eef=[0.985, 0.079, 1.359] tgt=[0.929, 0.000, 1.227]  ← above scanner
+MOVE_TO_SCANNER:510 eef=[0.997, 0.026, 1.294]                            ← descending
 ```
 
-**Root cause**: The gripper holds the carton at whatever orientation the GRASP phase ended with.
-During GRASP, IK converges joint configurations that may produce a tilted gripper.
-When released onto scanner, the carton retains this tilt.
+Round 14 (broken, with world-down):
+```
+MOVE_TO_SCANNER:480 eef=[0.806, -0.117, 1.219]   ← already y=-0.117 (scanner y=0)
+MOVE_TO_SCANNER:660 eef=[0.838, -0.192, 1.096]   ← lowering_scanner started, off-target
+MOVE_TO_SCANNER:720 eef=[0.850, -0.233, 1.074]   ← ended at y=-0.233 (0.23m past scanner!)
+```
 
-**Diagnostic data needed**: Log `obs["r_eef_quat"]` during MOVE_TO_SCANNER:
-- At "above_scanner" sub-phase
-- At release (gripper open) moment
+The arm released the carton at [0.85, -0.23, 1.07] — 0.23m off from scanner center
+in -y direction. Inside check still fires (table is wide), but carton lands tilted/off-center.
 
-Then convert to RPY to see how tilted the gripper is.
+**REGRASP also broken**:
 
-### Fix Strategy 24A: Force vertical gripper orientation during MOVE_TO_SCANNER
+Round 13 REGRASP:91 eef=[0.875, -0.030, 0.910]  ← above carton on scanner
+Round 14 REGRASP:91 eef=[0.271, -0.690, 0.815]  ← CRAZY position (y=-0.690!)
 
-In `_phase_move_to_scanner()`, at "above_scanner" sub-phase, override the gripper rotation:
+The world-down RPY caused the IK to choose drastically different joint configurations
+that move the gripper to entirely wrong xy locations.
+
+### Root cause analysis
+
+`_world_down_target_rpy` likely computes a target RPY in the arm_base local frame
+that, when commanded, conflicts with position targeting. Two issues:
+
+1. **Over-constraint**: Forcing both position AND a specific orientation may push
+   IK into singular configurations or cause the solver to prioritize orientation
+   over position.
+
+2. **Incorrect transform**: The conversion from world-down to local-frame RPY may
+   have a sign error or axis swap. The `arm_base_link` rotation includes a 90°
+   transform; the world -z direction maps to a non-trivial local axis.
+
+### Fix Strategy 27A: REVERT the world-down RPY override
+
+Restore Round 13's behavior where MOVE_TO_SCANNER uses the GRASP-time gripper
+orientation (whatever it was). Episode 4 succeeded by luck in Round 13, so
+average baseline can be recovered.
+
+### Fix Strategy 27B: Re-derive _world_down_target_rpy with verification
+
+If keeping the world-down concept:
+1. Log `obs["r_eef_quat"]` BEFORE and AFTER the override at first call
+2. Verify the resulting world-frame orientation IS pointing -z
+3. Test in isolation with no body lean first
+
+---
+
+## BUG 28 [HIGH]: Carton settled OUTSIDE bbox center on scanner
+
+Even with Inside=1, the carton's settled position is far from scanner center.
+This causes Upright to fail because the carton lands on the scanner's edge or
+support struts.
+
+**Diagnostic data needed**:
+After scanner placement, log the carton's settled (xyz, rpy):
+```python
+# In _phase_move_to_scanner, after release sub-step:
+real_carton = self._shared_state.get("real_carton_world")
+print(f"[Diag] Carton settled at {real_carton}")
+```
+
+If carton is off-center, the next REGRASP needs to query its real position
+(not the original scanner position) before attempting to grasp.
+
+Round 13 already does this for REGRASP → real carton tracking works. But the
+carton lands tilted regardless of position because of orientation issues.
+
+### Fix Strategy 28A: Approach scanner from above, descend straight down
+
+Currently MOVE_TO_SCANNER does "rotating_to_scanner" → "above_scanner" → "lowering".
+The lowering part may be sliding the carton off-center.
+
+Modification:
+1. Reach a high position DIRECTLY above scanner: target = (scanner_xy, scanner_z + 0.20)
+2. Hold position for 30 steps to stabilize
+3. Lower vertically (only z changes) to scanner_z + SCANNER_PLACE_HEIGHT
+4. Open gripper
+
+This decouples xy positioning from vertical descent.
+
+---
+
+## BUG 29 [HIGH]: Upright fundamentally needs gripper to release in vertical pose
+
+The carton is held by the gripper at whatever orientation the gripper has.
+For the carton to land upright, its z-axis (the "up" face in carton frame)
+must be parallel to world +z.
+
+**Cleanest approach**: At INIT, the GRASP picks the carton from above with the
+gripper pointing down. If the gripper STAYS pointing down through MOVE_TO_SCANNER,
+the carton stays upright.
+
+**Why it fails**: The bj5 (waist) rotation during MOVE_TO_SCANNER rotates the
+ENTIRE arm including the gripper. If the gripper was vertical before bj5 rotation,
+it remains vertical after (pure yaw rotation preserves vertical alignment).
+
+**Hypothesis**: Maybe the GRASP gripper is NOT vertical to start with. Then no
+amount of waist rotation will make it vertical at scanner.
+
+### Fix Strategy 29A: Diagnostic — log gripper RPY at GRASP completion
 
 ```python
-# Force gripper to point straight down (z-axis vertical)
-target_quat_world = np.array([0.0, 1.0, 0.0, 0.0])  # 180° flip about x
-# Or compute from world yaw for the bj5 setting
+# At end of GRASP phase (after lift):
+rpy = self._get_eef_rpy(obs["r_eef_quat"])
+print(f"[Diag] Gripper RPY at GRASP-end: roll={rpy[0]:.3f} pitch={rpy[1]:.3f} yaw={rpy[2]:.3f}")
 ```
 
-Use `_compute_right_ik` with explicit target orientation that aligns the gripper's
-"up" axis with world +z (so the carton's barcode-up face points to +z).
+Expected: roll≈±π (gripper flipped 180° to point down), pitch≈0.
 
-### Fix Strategy 24B: Add orientation correction step BEFORE release
+If gripper is not pointing down at GRASP end, fix GRASP to use vertical orientation.
 
-Insert a new sub-phase between "above_scanner" and "lowering_to_scanner":
-```
-Sub 2.5 (re-orient): Rotate gripper joints so gripper local-z aligns with world -z.
-```
+### Fix Strategy 29B: Force vertical gripper at GRASP, not at MOVE_TO_SCANNER
 
-This uses joint angles (esp. arm_r_link5/6/7) to physically rotate the wrist
-without changing the gripper xy position. The carton inside the gripper rotates
-with the gripper.
+Apply orientation control DURING GRASP (when picking up carton) rather than after.
+The gripper should point straight down (-z in world) when closing on the carton.
 
-### Fix Strategy 24C [SIMPLEST]: Wait longer at scanner before transition
-
-Maybe Episode 4 worked because it waited longer for carton to physically settle.
-Increase MOVE_TO_SCANNER hold steps after release: from current value to 200+ steps.
-
-But the failure log shows Upright `evt: 4` only fires at step 2107 (after 700+ steps),
-so it's not just settling time. The carton is genuinely tilted on scanner.
+This way the carton is held vertically from the start.
 
 ---
 
-## BUG 25 [HIGH]: Bin placement out of reach (8/8 fail)
+## Implementation Priority for Round 15
 
-**Symptom**: Episode 4 succeeded REGRASP_PickUp and reached MOVE_TO_BIN but
-released the carton 0.385m short of the bin.
+1. **BUG 27**: REVERT world-down RPY in MOVE_TO_SCANNER (restore Round 13 behavior).
+   Recovery to 0.5417 baseline.
 
-**Evidence — Episode 4 MOVE_TO_BIN trajectory**:
-```
-Bin world position: [0.300, -0.917, 0.838]
-Step 1140: eef=[0.837,-0.096,1.503] tgt=[0.300,-0.917,0.838] d=1.185 [rotating_to_bin]
-Step 1170: eef=[0.286,-0.293,1.673] tgt=[0.300,-0.917,0.838] d=1.042 [rotating_to_bin]
-Step 1200: eef=[0.115,-0.361,1.646] tgt=[0.236,-0.521,0.988] d=0.688 [extending_to_bin]
-Step 1290: eef=[0.199,-0.530,1.305] tgt=[0.236,-0.521,0.988] d=0.320 [extending_to_bin]
-Step 1320: eef=[0.217,-0.532,1.148] tgt=[0.236,-0.521,0.988] d=0.162 [extending_to_bin]
-                                                                      ↑ STALLED HERE
-Step 1414: MOVE_TO_BIN → RETURN  ← phase ended without reaching bin
-Step 6873: Action [Inside] evt: 4   ← carton landed OUTSIDE bin
-```
+2. **BUG 29A**: Add diagnostic logs for gripper RPY at GRASP-end and at scanner
+   release. This data is essential before attempting orientation fixes.
 
-The arm reached `[0.217, -0.532, 1.148]` but bin is at `[0.300, -0.917, 0.838]`:
-- x error: -0.083m
-- **y error: -0.385m** (bin is far in -y direction)
-- z error: +0.310m (gripper too high)
+3. **BUG 28A**: Decouple xy positioning from vertical descent at scanner.
 
-**Root cause**: The bin at y=-0.917 is **outside** arm's reachable workspace
-even with body lean. With arm_base at world y=0.093, the bin is 1.01m away in y alone.
-The arm is dropping carton too high and too far from bin.
-
-### Fix Strategy 25A: Use higher LIFT and rely on gravity drop
-
-Drop the carton from a higher altitude with horizontal velocity toward bin.
-Currently the carton is released at z=1.148m above ground (bin top at z=~0.84m,
-fall distance = 0.31m). The carton needs both y velocity AND vertical fall.
-
-Approach: at "extending_to_bin" with z held at ~1.3m, simply OPEN GRIPPER
-(`right_grip = 0.0`). Carton drops vertically. Position must be directly above bin.
-
-But arm can only reach y=-0.532 max, while bin is at y=-0.917. The release must
-happen at the FURTHEST reachable point AND have body leaning toward bin.
-
-### Fix Strategy 25B: Aggressive body lean toward bin
-
-For MOVE_TO_BIN, override body joints to lean far toward -y direction:
-- `bj1` (front-back lean): increase to extend reach
-- `bj2`: similar to BJ2_LEAN logic from Round 12
-- `bj3` (sideways lean): tilt toward bin
-
-Example:
-```python
-# Lean body aggressively toward bin (-y direction)
-BJ_BIN_LEAN = np.array([
-    -1.5,   # bj1: lean further forward
-    1.7,    # bj2: more forward extension
-    -0.319, # bj3: unchanged
-    0.3,    # bj4: small adjustment
-    -1.517, # bj5: bin yaw
-])
-```
-
-This may require physics testing — body joint limits could prevent this.
-
-### Fix Strategy 25C: Use chassis movement (drive robot to bin)
-
-The G2 robot has a wheeled chassis. The benchmark may allow chassis joint control.
-Drive the robot toward -y by ~0.3m so the bin enters arm reach.
-
-Check if `chassis_*` joints accept commands in the action space.
-
----
-
-## BUG 26 [MEDIUM]: Premature MOVE_TO_BIN → RETURN transition
-
-The MOVE_TO_BIN phase transitions to RETURN at sub_step=281 even though
-d_world=0.162m to target. The condition for transition is too loose — carton
-has not been released or has missed.
-
-In `_phase_move_to_bin()`, ensure the carton is dropped INTO the bin before
-phase ends. Use real-time carton z position: don't transition until carton has
-dropped to z < 0.95 (bin top + small margin) AND xy is within bin AABB.
-
----
-
-## Implementation Priority
-
-1. **BUG 24** (Upright): Highest impact — fixing this unlocks 7 more PickUpOnGripper
-   regrasps and 7 attempts at Inside(bin).
-2. **BUG 25** (Bin reach): Need either body lean OR chassis movement.
-3. **BUG 26** (Phase timing): Quick fix, prevents premature release.
+4. Skip world-down for MOVE_TO_BIN until BUG 27 is resolved (same root cause).
 
 ---
 
 ## Verification Checklist
 
-After fixes:
-- [ ] `[Upright] Object is upright` log appears for ALL 8 episodes (not just Ep4)
-- [ ] PickUpOnGripper (regrasp) score ≥ 6/8
-- [ ] Inside (bin) evt: 3 (SUCCESS) for at least one episode
-- [ ] Episode 4-style full chain success rate ≥ 4/8
+After Round 15 fixes:
+- [ ] Average score ≥ 0.5417 (recover Round 13 baseline)
+- [ ] `[Diag] Gripper RPY at GRASP-end` log appears
+- [ ] MOVE_TO_SCANNER trajectory ends with eef.y near 0.0 (not -0.2+)
+- [ ] At least 1 episode achieves Upright again
 
 ---
 
-## Round 13 Diagnostic Highlights
+## Round 14 Diagnostic Highlights
 
-### Carton position tracking works perfectly
+### MOVE_TO_SCANNER trajectory (yellow, Ep1)
 ```
-[Policy] Carton pos updated: [0.328, 0.687, 0.873] → [0.302, 0.700, 0.779] (diff=0.099m)
+[s=480] MOVE_TO_SCANNER:112 eef_real=[0.806,-0.117,1.219] [above_scanner] ← already off
+[s=510] MOVE_TO_SCANNER:142 eef_real=[0.833,-0.156,1.142] [above_scanner]
+[s=540] MOVE_TO_SCANNER:172 eef_real=[0.839,-0.170,1.119] [above_scanner]
+[s=660] MOVE_TO_SCANNER:292 eef_real=[0.838,-0.192,1.096] [lowering_scanner]
+[s=720] MOVE_TO_SCANNER:352 eef_real=[0.850,-0.233,1.074] [lowering_scanner] ← ENDS HERE
 ```
-Real-time tracking confirmed — Round 8's BUG 13 fully resolved.
+The arm continues moving in -y throughout. Target was [0.929, 0.000, 1.227].
 
-### Scanner placement works
+### REGRASP at wrong position
 ```
-Step 5277: MOVE_TO_SCANNER:142 eef=[0.996,0.024,1.292] [above_scanner]
-Step 5377: [Upright] dot=1.000  ← ONLY Episode 4 reached vertical settle
+[s=870] REGRASP:91 eef_real=[0.271,-0.690,0.815] tgt=[0.926,-0.300,0.838]
 ```
+The arm starts REGRASP at y=-0.69 — completely outside the scanner area.
 
-### REGRASP picks up carton (when Upright succeeds)
-```
-Step 5844: [PickUpOnGripper] Grasp detected successfully
-Step 6009: REGRASP → MOVE_TO_BIN  ← only Episode 4 reaches this
-```
+### Episode 4 in Round 13 (lucky success) NOT replicated in Round 14
+The world-down RPY change altered IK joint config across all episodes,
+breaking the lucky alignment that made Ep4 succeed.
 
 ---
 
-## Hotfixes Already Applied Locally
+## Recommendation Summary
 
-None this round — all changes from Round 13 (commit `2a58d70`) work as expected.
+**SAFEST PATH**: Revert Round 14's `_world_down_target_rpy` calls in BOTH
+MOVE_TO_SCANNER and MOVE_TO_BIN. Recover 0.5417 baseline. Then add diagnostic
+logs to understand actual gripper orientation before attempting orientation control.
 
-The remaining failures are fundamental control issues:
-1. Gripper orientation not enforced during placement (BUG 24)
-2. Bin out of arm reach (BUG 25)
+**Risky changes that need verification BEFORE deployment**:
+- Any IK orientation override
+- Body joint changes (BJ_BIN_LEAN was untested as no episode reached MOVE_TO_BIN extending)
