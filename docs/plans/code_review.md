@@ -1,12 +1,12 @@
-# Code Review & Modification Suggestions (Round 12)
+# Code Review & Modification Suggestions (Round 13)
 
-**Date**: 2026-04-16
+**Date**: 2026-04-17
 **Reviewer**: Local Claude Code (Evaluation)
 **Target**: Cloud Claude Code reads this doc and modifies code
 
 ---
 
-## Round 11 Result: Timing fix worked, but Upright regressed. Average = 0.3333
+## Round 12 Result: Body lean works! Black carton PickUp solved. Average = 0.5000
 
 ### Scores (8 episodes)
 
@@ -16,224 +16,202 @@
 | 2       | Yellow | **1** | **1** | **1** | 0 | 0 | 0 |
 | 3       | Yellow | **1** | **1** | **1** | 0 | 0 | 0 |
 | 4       | Yellow | **1** | **1** | **1** | 0 | 0 | 0 |
-| 5       | Black  | **1** | 0 | 0 | 0 | 0 | 0 |
-| 6       | Black  | **1** | 0 | 0 | 0 | 0 | 0 |
-| 7       | Black  | **1** | 0 | 0 | 0 | 0 | 0 |
-| 8       | Black  | **1** | 0 | 0 | 0 | 0 | 0 |
+| 5       | Black  | **1** | **1** | **1** | 0 | 0 | 0 |
+| 6       | Black  | **1** | **1** | **1** | 0 | 0 | 0 |
+| 7       | Black  | **1** | **1** | **1** | 0 | 0 | 0 |
+| 8       | Black  | **1** | **1** | **1** | 0 | 0 | 0 |
 
-**Average: 0.3333** (16/48 total points)
+**Average: 0.5000** (24/48 total points) — up from 0.3333
 
-### What Round 11 Changed
+### What Works Now
 
-1. **MOVE_TO_SCANNER timing cut** — completes in ~411 sub-steps (was 731). Step 780 vs 1100. This worked mechanically.
-2. **REGRASP targets real carton** — correctly reads `_shared_state["real_carton_world"]` instead of scanner position.
-3. **Faster waist rotation** — BJ5_SPEED=0.06 (was 0.04).
+1. **Body lean (bj2 +0.27 rad) works perfectly** — arm reaches x=0.997 (was x=0.874)
+2. **Black carton PickUp+Inside now 4/4** — was 0/4 in R11. Body lean fully solved the reach problem
+3. **All 8 episodes: Follow+PickUp+Inside pass** — 24/48 points
+4. **REGRASP successfully re-grips** — real_dist=0.037 at close, carton lifts
 
-### Why Upright Went from 1/4 to 0/4
+### Score progression
 
-The timing fix saved steps but did NOT fix the fundamental problem: **the arm cannot reach the scanner surface**. The carton is released at x=0.874, but the scanner center is at x=0.929 (deficit = 0.055m). The carton falls 0.27m to the ground regardless of timing. Whether it lands upright is pure physics luck (~25% chance).
-
-R10 got lucky on 1 episode. R11 got unlucky on all 4. The variance is expected because we're dropping the carton from 0.27m height.
-
-### Why REGRASP Still Fails
-
-Carton lands at x=0.891 (R11) or x=0.801 (R10) — variable depending on release dynamics. The arm's horizontal reach is ~0.869m from robot base. When the carton lands near x=0.89, it's beyond reach (d_world=0.089, arm stalls).
+R8=0.083 → R9=0.167 → R10=0.354 → R11=0.333 → **R12=0.500**
 
 ---
 
-## ROOT CAUSE: Arm reach is 0.06m too short for scanner
+## BUG 23 [CRITICAL]: Carton released too high — falls 0.30m to ground, Upright fails
 
-The arm_base_link is at a fixed position (determined by bj1-bj4 held constant). The arm can extend ~0.56m from arm_base. This is insufficient to reach the scanner at x=0.929.
+### Evidence (all 8 episodes identical pattern)
 
-**Solution: Body lean via bj2 adjustment.** bj2 is a pitch joint that tilts the torso forward. Increasing bj2 by 0.27 rad moves the arm_base_link forward by approximately 0.06m in the current facing direction. This closes the gap to the scanner.
+```
+Step 570 (sub=202): eef=[0.932,-0.001,1.179] carton=[0.931,0.005,1.144] d_world=0.032 [lowering_scanner]
+Step 600 (sub=232): eef=[0.930,-0.001,1.180] carton=[0.930,0.004,1.145] d_world=0.032 [lowering_scanner]
+Step 630 (sub=262): eef=[0.930,-0.001,1.181] carton=[0.929,0.004,1.145] d_world=0.033 [lowering_scanner]
 
-The body lean is controlled via `_patched_step`'s `set_joint_positions`. Currently bj1-bj4 are ALL held at fixed initial values. We modify this to allow bj2 to change dynamically, controlled by the policy via `_shared_state`.
+*** Between step 631-661: gripper opens, carton drops ***
+
+Step 661: carton=[0.879,0.011,0.846]  ← fell 0.299m to ground!
+Step 779 (sub=411): MOVE_TO_SCANNER → REGRASP
+```
+
+### Root Cause
+
+The lowering target is `scanner_pos[2] + GRASP_HEIGHT = 1.167 + (-0.02) = 1.147`. The arm reaches z=1.179 (0.032m above target) and stalls — IK workspace limit prevents going lower.
+
+When `dist` fluctuates below 0.03 (the `if dist > 0.03` threshold), the code falls through to the release phase. The gripper opens. The carton at z=1.145 is 0.022m BELOW the scanner center (z=1.167). The carton is NOT on the scanner surface — it's hanging in mid-air from the gripper. When released, it falls 0.299m to the ground.
+
+**Why the carton doesn't land on the scanner:**
+The gripper-to-carton offset is 0.034m (carton center is 0.034m below gripper center). With gripper at z=1.179, carton is at z=1.145. The scanner surface appears to be above z=1.145. The carton misses the scanner and falls through.
+
+### Fix Strategy
+
+There are two sub-problems:
+1. **Premature release**: `dist > 0.03` threshold triggers release when the arm merely stalls, not when it arrives
+2. **Wrong release height**: even with timeout release at sub=380, the carton is at the same height (z=1.145) and still falls
+
+**Solution: Release the carton from ABOVE the scanner and let gravity place it.**
+
+Instead of lowering all the way to `scanner_pos[2] - 0.02`, lower only to `scanner_pos[2] + SCANNER_PLACE_HEIGHT` where SCANNER_PLACE_HEIGHT is a small positive offset. The carton drops a short distance onto the scanner surface and stays upright.
+
+The key insight: the gripper-carton offset is ~0.034m. To place the carton bottom on the scanner surface, we need:
+```
+gripper_z = scanner_z + carton_half_height + gripper_carton_offset
+         ≈ 1.167 + 0.03 + 0.034
+         = 1.231
+```
+
+With target_z = 1.231, the arm lowers from z=1.29 (above_scanner) to z=1.231. The carton at z=1.197 would be slightly above the scanner. When released, it drops ~0.03m onto the scanner surface — gentle enough to stay upright.
 
 ---
 
 ## Implementation Plan
 
-### File: `scripts/run_sorting_benchmark.py`
-
-#### Change 1 [CRITICAL]: Add `desired_bj2` to shared state initialization
-
-After line 533 (`_shared_state = {"real_gripper_world": None}`), add:
-
-```python
-_shared_state = {"real_gripper_world": None, "desired_bj2": _bs[3]}
-```
-
-Here `_bs[3]` is the initial bj2 value (1.344 from body_state `[bj5,bj4,bj3,bj2,bj1]`, so `_bs[3]` = bj2).
-
-#### Change 2 [CRITICAL]: Add dynamic bj2 ramping in `_patched_step`
-
-Inside `_patched_step`, BEFORE the `set_joint_positions` call (before line 559), add bj2 ramping logic:
-
-```python
-                        # Dynamic bj2 control — ramp toward desired value
-                        _desired_bj2 = _shared_state.get("desired_bj2", _body_hold[1])
-                        if abs(_desired_bj2 - _body_hold[1]) > 0.005:
-                            _bj2_delta = min(0.01, abs(_desired_bj2 - _body_hold[1]))
-                            _body_hold[1] += _bj2_delta if _desired_bj2 > _body_hold[1] else -_bj2_delta
-                            if _step_counter[0] % 30 == 0:
-                                print(f"[Patch] bj2 ramping: current={_body_hold[1]:.3f} target={_desired_bj2:.3f}")
-```
-
-This goes AFTER the `_body_indices_cache` resolution block (line 550-558) and BEFORE the `set_joint_positions` call (line 559-564). The ramping rate is 0.01 rad/step, so 0.27 rad lean takes ~27 steps (about 1 second at 30Hz sim).
-
-**`_body_hold` is a mutable list** defined at line 528. Modifying `_body_hold[1]` inside the closure works because Python closures capture references to mutable objects.
-
-#### Change 3 [CRITICAL]: Query arm_base prim EVERY step (not just step 1)
-
-Currently arm_base prim pos/rot is only queried at step 1 (inside `if _step_counter[0] == 1:` block, lines 591-647). When bj2 changes, the arm_base position/rotation changes. The policy's `_world_target_to_solver_frame` uses `_shared_state["arm_base_rot"]` to compute local error direction. If this is stale, IK targets will have wrong direction.
-
-**Add after the carton query block** (after line 589), OUTSIDE the `if _step_counter[0] == 1:` block:
-
-```python
-                        # Query arm_base prim EVERY step (position changes with body lean)
-                        if "arm_base_prim" in _shared_state:
-                            try:
-                                _ab_p, _ab_r = _env.api_core.get_obj_world_pose(
-                                    _shared_state["arm_base_prim"]
-                                )
-                                _shared_state["arm_base_pos"] = [
-                                    float(_ab_p[i]) for i in range(3)
-                                ]
-                                _shared_state["arm_base_rot"] = [
-                                    float(_ab_r[i]) for i in range(4)
-                                ]
-                            except Exception:
-                                pass
-```
-
-This uses the arm_base prim path discovered at step 1 (`_shared_state["arm_base_prim"]`). The step 1 code that finds the prim path stays unchanged. We just add continuous tracking after step 1.
-
----
-
 ### File: `scripts/scripted_sorting_policy.py`
 
-#### Change 4 [CRITICAL]: Add body lean constants
+#### Change 1 [CRITICAL]: Add SCANNER_PLACE_HEIGHT constant
 
-Add after the existing motion parameters section (after line 81, `RELEASE_HOLD_STEPS = 30`):
-
-```python
-    # ── Body lean for extended reach ─────────────────────────────────
-    BJ2_INIT = 1.344          # initial bj2 value (from body_state)
-    BJ2_LEAN_OFFSET = 0.27    # radians forward lean (~0.06m reach extension)
-    BJ2_LEAN = BJ2_INIT + BJ2_LEAN_OFFSET  # = 1.614
-```
-
-#### Change 5 [CRITICAL]: Set desired_bj2 in `_set_phase`
-
-Replace the `_set_phase` method (line 432-436) with:
+After the existing motion parameters (after `RELEASE_HOLD_STEPS = 30`):
 
 ```python
-    def _set_phase(self, name: str) -> None:
-        print(f"[Policy] {self.phase} → {name} "
-              f"(step={self.step_count}, sub={self.sub_step})")
-        self.phase = name
-        self.sub_step = 0
-        # Body lean control via shared state
-        if self._shared_state is not None:
-            if name in ("APPROACH", "GRASP", "MOVE_TO_SCANNER", "REGRASP"):
-                self._shared_state["desired_bj2"] = self.BJ2_LEAN
-            elif name in ("MOVE_TO_BIN", "RETURN", "DONE"):
-                self._shared_state["desired_bj2"] = self.BJ2_INIT
+    SCANNER_PLACE_HEIGHT = 0.06   # m above scanner center for release (positive = above)
 ```
 
-**Lean schedule:**
-- **APPROACH**: Lean forward. Extends reach for all cartons. Yellow cartons don't need it (IK closed-loop handles overshoot), but black cartons NEED the extra 0.06m reach.
-- **GRASP**: Keep lean. Carton is being grasped and lifted.
-- **MOVE_TO_SCANNER**: Keep lean. This is the critical phase — lean provides the extra 0.06m to reach the scanner surface.
-- **REGRASP**: Keep lean. Carton is near scanner, needs extended reach.
-- **MOVE_TO_BIN**: Lean back to neutral. The bin is in a different direction; lean isn't needed and could interfere with rotation stability.
-- **RETURN, DONE**: Neutral position.
+This is more conservative than the calculated 0.03+0.034=0.064, giving a release from ~0.06m above scanner center. The carton bottom (0.034m below gripper, plus ~0.03m carton half-height) would be at scanner_z + 0.06 - 0.034 - 0.03 ≈ scanner_z - 0.004, essentially ON the scanner surface.
 
-**Why lean during APPROACH (not just MOVE_TO_SCANNER):**
-The black carton stalls at d_world=0.076m from target in APPROACH. The arm reach deficit is ~0.069m. Body lean adds ~0.06m reach in the facing direction. This brings the deficit to ~0.01m, which should be within the gripper's grasp range (gripper close threshold is `real_dist < 0.035`).
+#### Change 2 [CRITICAL]: Use SCANNER_PLACE_HEIGHT in MOVE_TO_SCANNER lowering phase
 
-The lean ramps at 0.01 rad/step, so it takes ~27 steps (under 1 second). APPROACH starts at step 30 and lasts 85-300 steps. The lean is fully established well before the arm reaches the carton.
+In `_phase_move_to_scanner`, replace Sub 3 (lowering onto scanner):
 
-For yellow cartons, the lean is harmless because:
-1. The closed-loop relative-error IK adjusts targets every step
-2. The arm_base prim is queried every step (Change 3), so the IK always uses the correct arm_base position
-3. Yellow carton APPROACH completes quickly (dist < 0.03 within ~85 steps)
+**Replace this block:**
+```python
+        # Sub 3: lower onto scanner
+        target_w = self._scanner_pos.copy()
+        target_w[2] += self.GRASP_HEIGHT
+```
+
+**With:**
+```python
+        # Sub 3: lower to scanner release height (NOT all the way down)
+        target_w = self._scanner_pos.copy()
+        target_w[2] += self.SCANNER_PLACE_HEIGHT
+```
+
+This changes the lowering target from z=1.147 to z=1.227. The arm can easily reach z=1.227 (it was at z=1.29 in the above_scanner phase). The carton would be placed more gently.
+
+#### Change 3 [IMPORTANT]: Prevent premature release from dist threshold
+
+The `dist > 0.03` condition in the lowering phase triggers release when the arm merely stalls (d_world ≈ 0.032). This is premature.
+
+**In `_phase_move_to_scanner`, change the lowering condition from:**
+```python
+        if dist > 0.03 and self.sub_step < 380:
+```
+
+**To:**
+```python
+        if dist > 0.02 and self.sub_step < 380:
+```
+
+With the higher target z (Change 2), the arm should converge well. Lowering the threshold to 0.02 ensures release only happens when truly converged or at timeout.
+
+#### Change 4 [IMPORTANT]: Add scanner geometry diagnostics
+
+In `_patched_step`, at step 1 (inside the existing `if _step_counter[0] == 1:` block), add scanner prim query to understand its actual geometry:
+
+```python
+                            # Query scanner prim geometry
+                            for scanner_path in ["/Workspace/Objects/scanning_table",
+                                                 "/Workspace/Objects/scanner",
+                                                 "/Workspace/Objects/barcode_scanner"]:
+                                try:
+                                    sp, sr = _env.api_core.get_obj_world_pose(scanner_path)
+                                    print(f"[Scanner] {scanner_path}: pos=[{sp[0]:.4f},{sp[1]:.4f},{sp[2]:.4f}]")
+                                    break
+                                except Exception:
+                                    continue
+```
+
+This helps us understand where the scanner surface actually is for future calibration.
+
+#### Change 5 [IMPORTANT]: Must pass `--app.headless true` for Docker benchmark
+
+The benchmark was hanging because the script defaults to `app.headless=false`. In Docker without a display, the Isaac Sim rendering loop stalls.
+
+In `scripts/run_sorting_benchmark.py`, change:
+```python
+    "app.headless": "false",          # default to graphical for local
+```
+
+**To:**
+```python
+    "app.headless": "true",           # headless mode for Docker/benchmark
+```
+
+This prevents future benchmark hangs. The headless mode was the root cause of the R12 deployment delay.
 
 ---
 
 ## Expected Behavior After Fix
 
-### Timeline (yellow carton with body lean):
+### Release comparison:
 
-```
-Step   0-30:   INIT (30 steps, bj2=1.344)
-Step  30-57:   APPROACH starts, bj2 ramps 1.344 → 1.614 (27 steps)
-Step  57-115:  APPROACH continues at full lean, arm reaches carton easily
-Step 115-369:  GRASP (same as before, lean maintained)
-Step 369-780:  MOVE_TO_SCANNER (with lean!)
-               Arm_base is ~0.06m farther forward
-               Arm can now reach x ≈ 0.929 (scanner center!)
-               Carton placed ON scanner surface, not dropped from 0.27m height
-               Upright: carton is ON the surface → trivially passes (<5° angle)
-Step 780-1100: REGRASP (with lean)
-               Carton is ON scanner → easy to re-grasp in place
-               PickUp2 should trigger
-Step 1100+:    MOVE_TO_BIN (lean back), rotate, extend, drop
-               Inside2 possible
-```
-
-### Key difference from Round 11:
-
-| Aspect | Round 11 | Round 12 (expected) |
+| Aspect | Round 12 | Round 13 (expected) |
 |--------|----------|---------------------|
-| Scanner reach | x=0.874 (0.055m short) | x≈0.929 (ON scanner) |
-| Carton drop height | 0.27m to ground | ~0m (placed on surface) |
-| Upright probability | ~25% (random fall) | ~90%+ (placed flat) |
-| REGRASP target distance | 0.089m (beyond reach) | ~0m (carton on scanner, in reach) |
-| Black carton APPROACH | stalls at 0.076m | closes to ~0.01m (within grasp) |
+| Release target z | 1.147 (below scanner) | 1.227 (above scanner) |
+| Gripper z at release | 1.179 (stalled) | ~1.227 (converged) |
+| Carton z at release | 1.145 | ~1.193 |
+| Drop distance | 0.299m (to ground) | ~0.03m (onto scanner) |
+| Landing | Tumbles on ground | Gentle onto scanner |
+| Upright probability | ~0% | ~90%+ |
 
 ### Expected score:
 
-| Metric | R11 (Yellow) | R12 Expected (Yellow) | R11 (Black) | R12 Expected (Black) |
-|--------|-------------|----------------------|-------------|---------------------|
-| Follow | 4/4 | 4/4 | 4/4 | 4/4 |
-| PickUp | 4/4 | 4/4 | 0/4 | 2-4/4 (lean helps reach) |
-| Inside | 4/4 | 4/4 | 0/4 | 0-2/4 |
-| Upright | 0/4 | 3-4/4 | 0/4 | 0/4 |
-| PickUp2 | 0/4 | 2-4/4 | 0/4 | 0/4 |
-| Inside2 | 0/4 | 1-3/4 | 0/4 | 0/4 |
+| Metric | R12 (All) | R13 Expected |
+|--------|-----------|--------------|
+| Follow | 8/8 | 8/8 |
+| PickUp | 8/8 | 8/8 |
+| Inside | 8/8 | 8/8 |
+| Upright | 0/8 | 6-8/8 |
+| PickUp2 | 0/8 | 3-6/8 (carton on scanner → easy regrasp) |
+| Inside2 | 0/8 | 2-4/8 |
 
-**Projected score: 0.42-0.58** (vs 0.3333 current)
+**Projected score: 0.65-0.80** (vs 0.50 current)
 
 ---
 
 ## Verification Checklist
 
-- [ ] `_shared_state["desired_bj2"]` initialized to 1.344 in `run_sorting_benchmark.py`
-- [ ] bj2 ramps smoothly in `_patched_step` (check log: `[Patch] bj2 ramping`)
-- [ ] Arm_base prim queried every step (not just step 1)
-- [ ] Arm reaches scanner center (x ≈ 0.929, was x=0.874)
-- [ ] Carton placed on scanner surface (not dropped to ground)
-- [ ] Upright passes for >= 3/4 yellow episodes (was 0/4)
-- [ ] REGRASP succeeds (carton on scanner, easy to re-grasp)
-- [ ] PickUp2 triggers for >= 1 yellow episode (was 0/4)
-- [ ] Black carton PickUp improved (arm reaches closer, was stalled at 0.076m)
-- [ ] No regression in Follow or Inside scores
-- [ ] Robot remains stable during lean (no tipping or oscillation)
+- [ ] SCANNER_PLACE_HEIGHT = 0.06 added as constant
+- [ ] Lowering target uses SCANNER_PLACE_HEIGHT (not GRASP_HEIGHT)
+- [ ] Release threshold lowered to dist > 0.02
+- [ ] Carton z at release is >= 1.19 (above scanner center)
+- [ ] Carton drop distance <= 0.05m (was 0.30m)
+- [ ] Upright passes for >= 4/8 episodes
+- [ ] app.headless defaults to "true"
+- [ ] No regression in Follow/PickUp/Inside scores
 
 ---
 
 ## Priority Summary
 
-1. **Changes 1-3** (run_sorting_benchmark.py): Enable dynamic bj2 control infrastructure
-2. **Changes 4-5** (scripted_sorting_policy.py): Control body lean per phase
-
-All 5 changes are CRITICAL and must be implemented together. The body lean without continuous arm_base tracking (Change 3) will cause IK directional errors. The policy lean control (Changes 4-5) without the _patched_step infrastructure (Changes 1-2) does nothing.
-
----
-
-## Not Addressed (Round 13+)
-
-- **Fine-tuning BJ2_LEAN_OFFSET**: 0.27 rad is an estimate. If the real robot geometry differs from our FK model, we may need to adjust.
-- **Gripper RPY correction**: After lean, the gripper approaches at a ~15 degree tilt. This may or may not affect carton placement quality.
-- **MOVE_TO_BIN accuracy**: Depends on PickUp2 working first. Bin placement not yet verified.
+1. **Changes 1-2**: SCANNER_PLACE_HEIGHT — release carton above scanner (fixes Upright)
+2. **Change 3**: Lower dist threshold to prevent premature release
+3. **Change 4**: Scanner geometry diagnostics (for future calibration)
+4. **Change 5**: Headless mode default (prevents deployment hangs)
